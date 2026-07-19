@@ -1,0 +1,5 @@
+/bin/
+/.gomodcache/
+/gws-go
+/coverage.out
+/doc_response.json
