@@ -27,11 +27,14 @@ import (
 // TokenEnv supplies a pre-obtained access token when set.
 const TokenEnv = "GWS_GO_TOKEN"
 
-// DefaultScopes grants access only to the three supported Workspace APIs.
+// DefaultScopes grants access to the supported Workspace APIs. Gmail access is
+// intentionally read-only.
 var DefaultScopes = []string{
 	"https://www.googleapis.com/auth/documents",
 	"https://www.googleapis.com/auth/calendar",
 	"https://www.googleapis.com/auth/presentations",
+	"https://www.googleapis.com/auth/gmail.readonly",
+	"https://www.googleapis.com/auth/drive",
 }
 
 // ClientFile models the OAuth client JSON downloaded from Google Cloud.

@@ -21,22 +21,26 @@ func TestLoaderFetchesThenCaches(t *testing.T) {
 			StatusCode: http.StatusOK,
 			Header:     make(http.Header),
 			Body: io.NopCloser(strings.NewReader(
-				`{"name":"docs","version":"v1","rootUrl":"https://docs.googleapis.com/","resources":{}}`,
+				`{"name":"drive","version":"v3","rootUrl":"https://www.googleapis.com/","resources":{"files":{"methods":{"create":{"httpMethod":"POST","path":"files","supportsMediaUpload":true,"mediaUpload":{"protocols":{"simple":{"multipart":true,"path":"upload/drive/v3/files"}}}}}}}}`,
 			)),
 		}, nil
 	})}
 	loader := Loader{Client: client, BaseURL: "https://discovery.example.test"}
 	for range 2 {
-		doc, err := loader.Load(context.Background(), "docs", "v1")
-		if err != nil || doc.Name != "docs" {
+		doc, err := loader.Load(context.Background(), "drive", "v3")
+		if err != nil || doc.Name != "drive" {
 			t.Fatalf("doc=%#v err=%v", doc, err)
+		}
+		method := doc.Resources["files"].Methods["create"]
+		if !method.SupportsMediaUpload || method.MediaUpload.Protocols.Simple.Path != "upload/drive/v3/files" {
+			t.Fatalf("upload metadata was not decoded: %#v", method)
 		}
 	}
 	if requests != 1 {
 		t.Fatalf("requests = %d, want 1", requests)
 	}
 	dir, _ := appconfig.Dir()
-	if info, err := os.Stat(filepath.Join(dir, "cache", "docs_v1.json")); err != nil || info.Mode().Perm() != 0o600 {
+	if info, err := os.Stat(filepath.Join(dir, "cache", "drive_v3.json")); err != nil || info.Mode().Perm() != 0o600 {
 		t.Fatalf("cache info=%v err=%v", info, err)
 	}
 }

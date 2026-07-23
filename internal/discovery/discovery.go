@@ -39,14 +39,33 @@ type Resource struct {
 
 // Method describes one callable REST API method.
 type Method struct {
-	ID             string                `json:"id"`
-	Description    string                `json:"description"`
-	HTTPMethod     string                `json:"httpMethod"`
-	Path           string                `json:"path"`
-	FlatPath       string                `json:"flatPath"`
-	Parameters     map[string]*Parameter `json:"parameters"`
-	ParameterOrder []string              `json:"parameterOrder"`
-	Request        *SchemaRef            `json:"request"`
+	ID                  string                `json:"id"`
+	Description         string                `json:"description"`
+	HTTPMethod          string                `json:"httpMethod"`
+	Path                string                `json:"path"`
+	FlatPath            string                `json:"flatPath"`
+	Parameters          map[string]*Parameter `json:"parameters"`
+	ParameterOrder      []string              `json:"parameterOrder"`
+	Request             *SchemaRef            `json:"request"`
+	SupportsMediaUpload bool                  `json:"supportsMediaUpload"`
+	MediaUpload         *MediaUpload          `json:"mediaUpload"`
+}
+
+// MediaUpload describes the upload protocols exposed by a discovered method.
+type MediaUpload struct {
+	Accept    []string             `json:"accept"`
+	Protocols MediaUploadProtocols `json:"protocols"`
+}
+
+// MediaUploadProtocols contains the available Google media upload protocols.
+type MediaUploadProtocols struct {
+	Simple *MediaUploadProtocol `json:"simple"`
+}
+
+// MediaUploadProtocol describes one upload endpoint.
+type MediaUploadProtocol struct {
+	Multipart bool   `json:"multipart"`
+	Path      string `json:"path"`
 }
 
 // Parameter describes a path or query parameter.

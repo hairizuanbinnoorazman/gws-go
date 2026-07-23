@@ -3,6 +3,7 @@ package auth
 import (
 	"encoding/json"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -47,5 +48,24 @@ func TestParseScopes(t *testing.T) {
 	got := ParseScopes(" scope-a,scope-b ,, ")
 	if len(got) != 2 || got[0] != "scope-a" || got[1] != "scope-b" {
 		t.Fatalf("unexpected scopes: %#v", got)
+	}
+}
+
+func TestDefaultScopesIncludeReadOnlyGmail(t *testing.T) {
+	const gmailReadOnly = "https://www.googleapis.com/auth/gmail.readonly"
+	if !slices.Contains(DefaultScopes, gmailReadOnly) {
+		t.Fatalf("default scopes do not contain %q: %#v", gmailReadOnly, DefaultScopes)
+	}
+	for _, scope := range DefaultScopes {
+		if strings.HasPrefix(scope, "https://www.googleapis.com/auth/gmail") && scope != gmailReadOnly {
+			t.Fatalf("default scopes grant non-read-only Gmail access: %q", scope)
+		}
+	}
+}
+
+func TestDefaultScopesIncludeDrive(t *testing.T) {
+	const drive = "https://www.googleapis.com/auth/drive"
+	if !slices.Contains(DefaultScopes, drive) {
+		t.Fatalf("default scopes do not contain %q: %#v", drive, DefaultScopes)
 	}
 }

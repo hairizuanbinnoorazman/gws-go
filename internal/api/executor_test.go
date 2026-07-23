@@ -2,9 +2,13 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"io"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 
@@ -63,6 +67,137 @@ func TestBuildURLRejectsUnsafeReservedPath(t *testing.T) {
 	}}
 	if _, err := BuildURL(doc, method, map[string]any{"name": "documents/../secret"}); err == nil {
 		t.Fatal("expected unsafe reserved path to be rejected")
+	}
+}
+
+func TestBuildUploadURL(t *testing.T) {
+	doc := &discovery.Document{
+		RootURL:    "https://www.googleapis.com/",
+		BaseURL:    "https://www.googleapis.com/drive/v3/",
+		Parameters: map[string]*discovery.Parameter{"fields": {}},
+	}
+	method := multipartUploadMethod()
+	got, err := buildURL(doc, method, map[string]any{"fields": "id,name"}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := url.Parse(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Path != "/upload/drive/v3/files" {
+		t.Fatalf("unexpected upload path: %s", parsed.Path)
+	}
+	if parsed.Query().Get("uploadType") != "multipart" || parsed.Query().Get("fields") != "id,name" {
+		t.Fatalf("unexpected upload query: %s", parsed.RawQuery)
+	}
+}
+
+func TestExecutorUploadsMultipartMedia(t *testing.T) {
+	uploadPath := t.TempDir() + "/report.txt"
+	if err := os.WriteFile(uploadPath, []byte("hello drive"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != "/upload/drive/v3/files" || r.URL.Query().Get("uploadType") != "multipart" {
+			t.Fatalf("unexpected upload URL: %s", r.URL)
+		}
+		mediaType, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+		if err != nil || mediaType != "multipart/related" {
+			t.Fatalf("content type=%q params=%#v err=%v", mediaType, params, err)
+		}
+		reader := multipart.NewReader(r.Body, params["boundary"])
+		metadataPart, err := reader.NextPart()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var metadata map[string]any
+		if err := json.NewDecoder(metadataPart).Decode(&metadata); err != nil {
+			t.Fatal(err)
+		}
+		if metadata["name"] != "report.txt" {
+			t.Fatalf("unexpected metadata: %#v", metadata)
+		}
+		mediaPart, err := reader.NextPart()
+		if err != nil {
+			t.Fatal(err)
+		}
+		contents, err := io.ReadAll(mediaPart)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if mediaPart.Header.Get("Content-Type") != "text/plain" || string(contents) != "hello drive" {
+			t.Fatalf("media content-type=%q contents=%q", mediaPart.Header.Get("Content-Type"), contents)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"id":"file-id","name":"report.txt"}`)),
+		}, nil
+	})}
+	doc := &discovery.Document{RootURL: "https://www.googleapis.com/", BaseURL: "https://www.googleapis.com/drive/v3/"}
+	var out strings.Builder
+	err := (Executor{Client: client}).Execute(context.Background(), doc, multipartUploadMethod(), Options{
+		BodyJSON:          `{"name":"report.txt"}`,
+		UploadPath:        uploadPath,
+		UploadContentType: "text/plain",
+		Out:               &out,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), `"file-id"`) {
+		t.Fatalf("unexpected output: %s", out.String())
+	}
+}
+
+func TestExecutorDryRunPreviewsUpload(t *testing.T) {
+	uploadPath := t.TempDir() + "/report.txt"
+	if err := os.WriteFile(uploadPath, []byte("preview"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out strings.Builder
+	err := (Executor{}).Execute(context.Background(), &discovery.Document{
+		RootURL: "https://www.googleapis.com/",
+		BaseURL: "https://www.googleapis.com/drive/v3/",
+	}, multipartUploadMethod(), Options{
+		DryRun:     true,
+		UploadPath: uploadPath,
+		Out:        &out,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), `uploadType=multipart`) || !strings.Contains(out.String(), `"content_type": "text/plain`) {
+		t.Fatalf("unexpected dry-run output: %s", out.String())
+	}
+}
+
+func TestExecutorRejectsUnsafeUploadContentType(t *testing.T) {
+	uploadPath := t.TempDir() + "/report.txt"
+	if err := os.WriteFile(uploadPath, []byte("unsafe"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := (Executor{}).Execute(context.Background(), &discovery.Document{
+		RootURL: "https://www.googleapis.com/",
+	}, multipartUploadMethod(), Options{
+		DryRun:            true,
+		UploadPath:        uploadPath,
+		UploadContentType: "text/plain\r\nX-Injected: yes",
+	})
+	if err == nil || !strings.Contains(err.Error(), "CR or LF") {
+		t.Fatalf("expected content-type validation error, got %v", err)
+	}
+}
+
+func multipartUploadMethod() *discovery.Method {
+	return &discovery.Method{
+		HTTPMethod:          http.MethodPost,
+		Path:                "files",
+		SupportsMediaUpload: true,
+		MediaUpload: &discovery.MediaUpload{Protocols: discovery.MediaUploadProtocols{
+			Simple: &discovery.MediaUploadProtocol{Multipart: true, Path: "upload/drive/v3/files"},
+		}},
 	}
 }
 

@@ -28,6 +28,8 @@ var services = []service{
 	{Name: "docs", APIVersion: "v1", Description: "Read and write Google Docs"},
 	{Name: "calendar", APIVersion: "v3", Description: "Manage calendars and events"},
 	{Name: "slides", APIVersion: "v1", Description: "Read and write presentations"},
+	{Name: "gmail", APIVersion: "v1", Description: "Read Gmail messages and metadata"},
+	{Name: "drive", APIVersion: "v3", Description: "Manage files, folders, and shared drives"},
 }
 
 type dependencies struct {
@@ -44,7 +46,7 @@ func Execute() error {
 func newRootCommand(deps dependencies) *cobra.Command {
 	root := &cobra.Command{
 		Use:           "gws-go",
-		Short:         "Google Workspace CLI for Docs, Calendar, and Slides",
+		Short:         "Google Workspace CLI for Docs, Calendar, Slides, Drive, and read-only Gmail",
 		Version:       version,
 		SilenceErrors: true,
 		SilenceUsage:  true,
@@ -133,6 +135,10 @@ func buildMethodCommand(doc *discovery.Document, name string, method *discovery.
 		command.Flags().StringVar(&opts.BodyJSON, "json", "", "JSON request body")
 	}
 	command.Flags().StringVarP(&opts.OutputPath, "output", "o", "", "write the raw response body to a file")
+	if method.SupportsMediaUpload && method.MediaUpload != nil && method.MediaUpload.Protocols.Simple != nil && method.MediaUpload.Protocols.Simple.Multipart {
+		command.Flags().StringVar(&opts.UploadPath, "upload", "", "local file to upload as multipart media content")
+		command.Flags().StringVar(&opts.UploadContentType, "upload-content-type", "", "MIME type of the uploaded file (detected automatically when omitted)")
+	}
 	command.Flags().BoolVar(&opts.DryRun, "dry-run", false, "print the request without sending it")
 	command.Flags().BoolVar(&opts.PageAll, "page-all", false, "fetch all pages as sequential JSON values")
 	command.Flags().IntVar(&opts.PageLimit, "page-limit", 10, "maximum pages fetched with --page-all")
