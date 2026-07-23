@@ -10,7 +10,7 @@ import (
 
 func TestRootHasRequestedServices(t *testing.T) {
 	root := newRootCommand(dependencies{out: &bytes.Buffer{}, errOut: &bytes.Buffer{}})
-	for _, name := range []string{"auth", "docs", "calendar", "slides", "gmail", "drive"} {
+	for _, name := range []string{"auth", "docs", "calendar", "slides", "gmail", "drive", "photos"} {
 		if root.Commands()[0] == nil {
 			t.Fatal("unexpected empty command list")
 		}

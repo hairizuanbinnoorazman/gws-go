@@ -46,7 +46,7 @@ func Execute() error {
 func newRootCommand(deps dependencies) *cobra.Command {
 	root := &cobra.Command{
 		Use:           "gws-go",
-		Short:         "Google Workspace CLI for Docs, Calendar, Slides, Drive, and read-only Gmail",
+		Short:         "Google Workspace CLI for Docs, Calendar, Slides, Drive, Gmail, and Photos",
 		Version:       version,
 		SilenceErrors: true,
 		SilenceUsage:  true,
@@ -54,6 +54,7 @@ func newRootCommand(deps dependencies) *cobra.Command {
 	root.SetOut(deps.out)
 	root.SetErr(deps.errOut)
 	root.AddCommand(newAuthCommand(deps.out))
+	root.AddCommand(newPhotosCommand(deps.out))
 	for _, item := range services {
 		root.AddCommand(newServiceCommand(item, deps))
 	}

@@ -35,6 +35,7 @@ var DefaultScopes = []string{
 	"https://www.googleapis.com/auth/presentations",
 	"https://www.googleapis.com/auth/gmail.readonly",
 	"https://www.googleapis.com/auth/drive",
+	"https://www.googleapis.com/auth/photospicker.mediaitems.readonly",
 }
 
 // ClientFile models the OAuth client JSON downloaded from Google Cloud.

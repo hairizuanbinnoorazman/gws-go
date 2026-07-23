@@ -69,3 +69,10 @@ func TestDefaultScopesIncludeDrive(t *testing.T) {
 		t.Fatalf("default scopes do not contain %q: %#v", drive, DefaultScopes)
 	}
 }
+
+func TestDefaultScopesIncludePhotosPicker(t *testing.T) {
+	const picker = "https://www.googleapis.com/auth/photospicker.mediaitems.readonly"
+	if !slices.Contains(DefaultScopes, picker) {
+		t.Fatalf("default scopes do not contain %q: %#v", picker, DefaultScopes)
+	}
+}

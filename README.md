@@ -2,8 +2,9 @@
 
 A focused Go port of the Google Workspace CLI, built with Cobra. It exposes the
 Google Docs, Google Calendar, Google Slides, Google Drive, and Gmail REST APIs
-from Google's Discovery documents and caches those documents for 24 hours.
-Gmail authorization is read-only.
+from Google's Discovery documents and caches those documents for 24 hours. It
+also supports selecting and downloading personal media through the Google
+Photos Picker API. Gmail authorization is read-only.
 
 ## Build and development
 
@@ -23,7 +24,7 @@ inside the repository (`.gomodcache/` and `bin/`) and are ignored by Git.
 ## OAuth setup
 
 1. In Google Cloud Console, enable the Google Docs API, Google Calendar API,
-   Google Slides API, Google Drive API, and Gmail API.
+   Google Slides API, Google Drive API, Gmail API, and Google Photos Picker API.
 2. Configure the OAuth consent screen and add your Google account as a test user
    if the app is in testing mode.
 3. Create an OAuth client with application type **Desktop app**, then download
@@ -46,6 +47,8 @@ bin/gws-go auth logout
 ```
 
 For short-lived automation, `GWS_GO_TOKEN` can provide an access token directly.
+Existing users must run `auth login` again to grant the Google Photos Picker
+scope.
 
 ## Usage
 
@@ -58,6 +61,7 @@ bin/gws-go calendar --help
 bin/gws-go slides --help
 bin/gws-go gmail --help
 bin/gws-go drive --help
+bin/gws-go photos --help
 
 # Fetch a document
 bin/gws-go docs documents get \
@@ -80,6 +84,9 @@ bin/gws-go drive files create \
   --json '{"name":"report.pdf"}' \
   --upload ./report.pdf
 
+# Pick a day's photos or videos in Google Photos and download them
+bin/gws-go photos download --output-dir ./day-photos
+
 # Validate and preview a request without authenticating or sending it
 bin/gws-go calendar events insert \
   --params '{"calendarId":"primary"}' \
@@ -95,8 +102,12 @@ optional `--upload-content-type`.
 
 The Gmail Discovery document includes write methods, but the default OAuth grant
 uses only `https://www.googleapis.com/auth/gmail.readonly`; Gmail rejects send,
-modify, and delete operations. Existing users must run `auth login` again to
-grant the new Gmail and Drive scopes.
+modify, and delete operations.
+
+Google no longer permits apps to search an existing personal Photos library by
+date. The supported Picker flow opens Google Photos so you can select the media
+for the day, waits for you to finish, downloads the selected media, and cleans
+up the Picker session.
 
 This is intentionally not a full port. It does not yet include the original
 CLI's handwritten helper commands, schema introspection, alternate output
