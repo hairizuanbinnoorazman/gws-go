@@ -70,6 +70,35 @@ func TestDefaultScopesIncludeDrive(t *testing.T) {
 	}
 }
 
+func TestDefaultScopesIncludeSheets(t *testing.T) {
+	const sheets = "https://www.googleapis.com/auth/spreadsheets"
+	if !slices.Contains(DefaultScopes, sheets) {
+		t.Fatalf("default scopes do not contain %q: %#v", sheets, DefaultScopes)
+	}
+}
+
+func TestGmailWriteScopeIsOptIn(t *testing.T) {
+	const (
+		readOnly = "https://www.googleapis.com/auth/gmail.readonly"
+		modify   = "https://www.googleapis.com/auth/gmail.modify"
+		send     = "https://www.googleapis.com/auth/gmail.send"
+	)
+	standard, err := ScopesForPreset("standard")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(standard, readOnly) || slices.Contains(standard, modify) || slices.Contains(standard, send) {
+		t.Fatalf("standard scopes = %#v", standard)
+	}
+	write, err := ScopesForPreset("gmail-write")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(write, readOnly) || !slices.Contains(write, modify) || !slices.Contains(write, send) {
+		t.Fatalf("gmail-write scopes = %#v", write)
+	}
+}
+
 func TestDefaultScopesIncludePhotosPicker(t *testing.T) {
 	const picker = "https://www.googleapis.com/auth/photospicker.mediaitems.readonly"
 	if !slices.Contains(DefaultScopes, picker) {

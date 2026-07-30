@@ -4,14 +4,17 @@ package discovery
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"time"
 
+	"github.com/hairizuanbinnoorazman/gws-go/internal/clierr"
 	appconfig "github.com/hairizuanbinnoorazman/gws-go/internal/config"
 )
 
@@ -29,6 +32,7 @@ type Document struct {
 	BaseURL     string                `json:"baseUrl"`
 	Resources   map[string]*Resource  `json:"resources"`
 	Parameters  map[string]*Parameter `json:"parameters"`
+	Schemas     map[string]*Schema    `json:"schemas"`
 }
 
 // Resource groups API methods and nested resources.
@@ -70,14 +74,37 @@ type MediaUploadProtocol struct {
 
 // Parameter describes a path or query parameter.
 type Parameter struct {
-	Location string `json:"location"`
-	Required bool   `json:"required"`
-	Repeated bool   `json:"repeated"`
+	Location         string   `json:"location"`
+	Required         bool     `json:"required"`
+	Repeated         bool     `json:"repeated"`
+	Type             string   `json:"type"`
+	Format           string   `json:"format"`
+	Description      string   `json:"description"`
+	Enum             []string `json:"enum"`
+	EnumDescriptions []string `json:"enumDescriptions"`
+	Default          any      `json:"default"`
 }
 
 // SchemaRef identifies a request body schema.
 type SchemaRef struct {
 	Ref string `json:"$ref"`
+}
+
+// Schema describes a JSON value in a Discovery document.
+type Schema struct {
+	Ref                  string             `json:"$ref,omitempty"`
+	ID                   string             `json:"id,omitempty"`
+	Type                 string             `json:"type,omitempty"`
+	Format               string             `json:"format,omitempty"`
+	Description          string             `json:"description,omitempty"`
+	Required             any                `json:"required,omitempty"`
+	Properties           map[string]*Schema `json:"properties,omitempty"`
+	Items                *Schema            `json:"items,omitempty"`
+	AdditionalProperties *Schema            `json:"additionalProperties,omitempty"`
+	Enum                 []any              `json:"enum,omitempty"`
+	Default              any                `json:"default,omitempty"`
+	Example              any                `json:"example,omitempty"`
+	ReadOnly             bool               `json:"readOnly,omitempty"`
 }
 
 // Loader fetches and caches Discovery documents.
@@ -127,7 +154,10 @@ func (l Loader) Load(ctx context.Context, service, version string) (*Document, e
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("fetch Discovery document: %w", err)
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return nil, clierr.New("discovery_timeout", "fetch Discovery document", clierr.ExitTimeout, err)
+		}
+		return nil, clierr.New("network_error", "fetch Discovery document", clierr.ExitNetwork, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
@@ -135,7 +165,10 @@ func (l Loader) Load(ctx context.Context, service, version string) (*Document, e
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("fetch Discovery document: HTTP %d: %s", resp.StatusCode, body)
+		fetchErr := clierr.New("discovery_error", fmt.Sprintf("fetch Discovery document: HTTP %d", resp.StatusCode), clierr.ExitAPI, nil)
+		fetchErr.Status = resp.StatusCode
+		fetchErr.Details = strings.TrimSpace(string(body))
+		return nil, fetchErr
 	}
 	var doc Document
 	if err := json.Unmarshal(body, &doc); err != nil {

@@ -17,10 +17,12 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
 
+	"github.com/hairizuanbinnoorazman/gws-go/internal/clierr"
 	"github.com/hairizuanbinnoorazman/gws-go/internal/discovery"
 )
 
@@ -31,16 +33,27 @@ type Options struct {
 	OutputPath        string
 	UploadPath        string
 	UploadContentType string
+	ParamsFile        string
+	BodyFile          string
+	Input             io.Reader
 	DryRun            bool
 	PageAll           bool
 	PageLimit         int
 	PageDelay         time.Duration
+	RequestTimeout    time.Duration
+	MaxRetries        int
+	RetryDelay        time.Duration
+	Format            string
+	Fields            string
+	Quiet             bool
 	Out               io.Writer
 }
 
 // Executor sends requests to a Google Workspace REST API.
 type Executor struct {
 	Client *http.Client
+	Now    func() time.Time
+	Sleep  func(context.Context, time.Duration) error
 }
 
 var templatePattern = regexp.MustCompile(`\{(\+?)([^}]+)\}`)
@@ -53,17 +66,33 @@ func (e Executor) Execute(ctx context.Context, doc *discovery.Document, method *
 	if opts.PageLimit <= 0 {
 		opts.PageLimit = 10
 	}
-	params, err := parseObject(opts.ParamsJSON, "--params")
-	if err != nil {
-		return err
+	if opts.MaxRetries < 0 {
+		return clierr.New("invalid_argument", "--max-retries must not be negative", clierr.ExitInput, nil)
 	}
-	body, err := parseBody(opts.BodyJSON)
+	if opts.RequestTimeout < 0 {
+		return clierr.New("invalid_argument", "--timeout must not be negative", clierr.ExitInput, nil)
+	}
+	if opts.RetryDelay < 0 {
+		return clierr.New("invalid_argument", "--retry-delay must not be negative", clierr.ExitInput, nil)
+	}
+	paramsJSON, bodyJSON, err := resolveJSONInputs(opts)
 	if err != nil {
-		return err
+		return clierr.New("invalid_argument", err.Error(), clierr.ExitInput, nil)
+	}
+	params, err := parseObject(paramsJSON, "--params")
+	if err != nil {
+		return clierr.New("invalid_argument", err.Error(), clierr.ExitInput, nil)
+	}
+	body, err := parseBody(bodyJSON)
+	if err != nil {
+		return clierr.New("invalid_argument", err.Error(), clierr.ExitInput, nil)
+	}
+	if err := doc.ValidateRequest(method.Request, body); err != nil {
+		return clierr.New("request_validation_failed", err.Error(), clierr.ExitInput, nil)
 	}
 	isUpload := opts.UploadPath != ""
 	if isUpload && opts.PageAll {
-		return errors.New("--upload cannot be combined with --page-all")
+		return clierr.New("invalid_argument", "--upload cannot be combined with --page-all", clierr.ExitInput, nil)
 	}
 	var uploadInfo map[string]any
 	if isUpload {
@@ -89,7 +118,7 @@ func (e Executor) Execute(ctx context.Context, doc *discovery.Document, method *
 	}
 	requestURL, err := buildURL(doc, method, params, isUpload)
 	if err != nil {
-		return err
+		return clierr.New("invalid_argument", err.Error(), clierr.ExitInput, nil)
 	}
 	if opts.DryRun {
 		preview := map[string]any{
@@ -105,6 +134,7 @@ func (e Executor) Execute(ctx context.Context, doc *discovery.Document, method *
 	}
 
 	pageURL := requestURL
+	var pageValues []any
 	for page := 1; ; page++ {
 		responseBody, contentType, err := e.request(ctx, method, pageURL, body, opts)
 		if err != nil {
@@ -124,25 +154,26 @@ func (e Executor) Execute(ctx context.Context, doc *discovery.Document, method *
 		}
 		var value any
 		isJSON := json.Unmarshal(responseBody, &value) == nil
-		if isJSON {
-			if err := writeJSON(opts.Out, value); err != nil {
-				return err
+		if !isJSON {
+			if opts.Format != "" && opts.Format != "json" {
+				return clierr.New("output_format_error", "non-JSON responses support only --format json or --output", clierr.ExitInput, nil)
 			}
-		} else {
 			if _, err := fmt.Fprintln(opts.Out, string(responseBody)); err != nil {
 				return err
 			}
-		}
-		if !opts.PageAll || !isJSON || page >= opts.PageLimit {
 			return nil
+		}
+		pageValues = append(pageValues, value)
+		if !opts.PageAll || page >= opts.PageLimit {
+			break
 		}
 		object, ok := value.(map[string]any)
 		if !ok {
-			return nil
+			break
 		}
 		next, _ := object["nextPageToken"].(string)
 		if next == "" {
-			return nil
+			break
 		}
 		parsed, err := url.Parse(requestURL)
 		if err != nil {
@@ -160,48 +191,263 @@ func (e Executor) Execute(ctx context.Context, doc *discovery.Document, method *
 			}
 		}
 	}
+	value := pageValues[0]
+	if opts.PageAll {
+		value = mergePages(pageValues)
+	}
+	if err := renderOutput(opts.Out, value, opts); err != nil {
+		return clierr.New("output_format_error", "render response", clierr.ExitInput, err)
+	}
+	return nil
+}
+
+func resolveJSONInputs(opts Options) (string, string, error) {
+	if opts.Input == nil {
+		opts.Input = os.Stdin
+	}
+	stdinUses := 0
+	for _, value := range []string{opts.ParamsJSON, opts.BodyJSON, opts.ParamsFile, opts.BodyFile} {
+		if value == "-" {
+			stdinUses++
+		}
+	}
+	if stdinUses > 1 {
+		return "", "", errors.New("stdin may be used by only one JSON input")
+	}
+	params, err := resolveJSONInput(opts.ParamsJSON, opts.ParamsFile, "--params", "--params-file", opts.Input)
+	if err != nil {
+		return "", "", err
+	}
+	body, err := resolveJSONInput(opts.BodyJSON, opts.BodyFile, "--json", "--json-file", opts.Input)
+	if err != nil {
+		return "", "", err
+	}
+	return params, body, nil
+}
+
+func resolveJSONInput(inline, path, inlineFlag, fileFlag string, input io.Reader) (string, error) {
+	if inline != "" && path != "" {
+		return "", fmt.Errorf("%s and %s cannot be combined", inlineFlag, fileFlag)
+	}
+	if inline == "-" {
+		data, err := io.ReadAll(io.LimitReader(input, 16<<20))
+		if err != nil {
+			return "", fmt.Errorf("read %s from stdin: %w", inlineFlag, err)
+		}
+		return string(data), nil
+	}
+	if path == "" {
+		return inline, nil
+	}
+	if path == "-" {
+		data, err := io.ReadAll(io.LimitReader(input, 16<<20))
+		if err != nil {
+			return "", fmt.Errorf("read %s from stdin: %w", fileFlag, err)
+		}
+		return string(data), nil
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", fmt.Errorf("inspect %s: %w", fileFlag, err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("%s must identify a regular file", fileFlag)
+	}
+	if info.Size() > 16<<20 {
+		return "", fmt.Errorf("%s exceeds the 16 MiB limit", fileFlag)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", fileFlag, err)
+	}
+	return string(data), nil
 }
 
 func (e Executor) request(ctx context.Context, method *discovery.Method, requestURL string, body any, opts Options) ([]byte, string, error) {
-	var reader io.Reader
+	var encodedBody []byte
 	contentType := ""
 	if opts.UploadPath != "" {
 		encoded, multipartType, err := buildMultipartUpload(body, opts.UploadPath, opts.UploadContentType)
 		if err != nil {
 			return nil, "", err
 		}
-		reader = bytes.NewReader(encoded)
+		encodedBody = encoded
 		contentType = multipartType
 	} else if body != nil {
 		encoded, err := json.Marshal(body)
 		if err != nil {
 			return nil, "", err
 		}
-		reader = bytes.NewReader(encoded)
+		encodedBody = encoded
 	}
-	req, err := http.NewRequestWithContext(ctx, method.HTTPMethod, requestURL, reader)
-	if err != nil {
-		return nil, "", err
+
+	for attempt := 0; ; attempt++ {
+		requestCtx := ctx
+		cancel := func() {}
+		if opts.RequestTimeout > 0 {
+			requestCtx, cancel = context.WithTimeout(ctx, opts.RequestTimeout)
+		}
+		var reader io.Reader
+		if encodedBody != nil {
+			reader = bytes.NewReader(encodedBody)
+		}
+		req, err := http.NewRequestWithContext(requestCtx, method.HTTPMethod, requestURL, reader)
+		if err != nil {
+			cancel()
+			return nil, "", err
+		}
+		if contentType != "" {
+			req.Header.Set("Content-Type", contentType)
+		} else if body != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		req.Header.Set("Accept", "application/json")
+		resp, err := e.Client.Do(req)
+		if err != nil {
+			cancel()
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
+				return nil, "", clierr.New("request_timeout", "Google API request timed out", clierr.ExitTimeout, err)
+			}
+			return nil, "", clierr.New("network_error", "Google API request failed", clierr.ExitNetwork, err)
+		}
+		responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+		closeErr := resp.Body.Close()
+		cancel()
+		if readErr != nil {
+			return nil, "", clierr.New("network_error", "read Google API response", clierr.ExitNetwork, readErr)
+		}
+		if closeErr != nil {
+			return nil, "", clierr.New("network_error", "close Google API response", clierr.ExitNetwork, closeErr)
+		}
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			return responseBody, resp.Header.Get("Content-Type"), nil
+		}
+
+		retryable := retryableStatus(resp.StatusCode)
+		if retryable && attempt < opts.MaxRetries {
+			delay := retryBackoff(opts.RetryDelay, attempt)
+			if retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"), e.now()); retryAfter > delay {
+				delay = retryAfter
+			}
+			if err := e.sleep(ctx, delay); err != nil {
+				return nil, "", err
+			}
+			continue
+		}
+		details := decodeErrorDetails(responseBody)
+		message := fmt.Sprintf("Google API returned HTTP %d", resp.StatusCode)
+		if detailMessage := errorDetailMessage(details); detailMessage != "" {
+			message += ": " + detailMessage
+		}
+		apiError := clierr.New("google_api_error", message, clierr.ExitAPI, nil)
+		apiError.Status = resp.StatusCode
+		apiError.Retryable = retryable
+		apiError.Attempts = attempt + 1
+		apiError.Details = details
+		return nil, "", apiError
 	}
-	if contentType != "" {
-		req.Header.Set("Content-Type", contentType)
-	} else if body != nil {
-		req.Header.Set("Content-Type", "application/json")
+}
+
+func retryableStatus(status int) bool {
+	switch status {
+	case http.StatusRequestTimeout, http.StatusTooManyRequests,
+		http.StatusInternalServerError, http.StatusBadGateway,
+		http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
 	}
-	req.Header.Set("Accept", "application/json")
-	resp, err := e.Client.Do(req)
-	if err != nil {
-		return nil, "", fmt.Errorf("google API request failed: %w", err)
+}
+
+func retryBackoff(base time.Duration, retry int) time.Duration {
+	if base <= 0 {
+		return 0
 	}
-	defer func() { _ = resp.Body.Close() }()
-	responseBody, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
-	if err != nil {
-		return nil, "", err
+	const maximum = 30 * time.Second
+	for range retry {
+		if base >= maximum/2 {
+			return maximum
+		}
+		base *= 2
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, "", fmt.Errorf("google API returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(responseBody)))
+	if base > maximum {
+		return maximum
 	}
-	return responseBody, resp.Header.Get("Content-Type"), nil
+	return base
+}
+
+func parseRetryAfter(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(value); err == nil {
+		if seconds <= 0 {
+			return 0
+		}
+		return time.Duration(seconds) * time.Second
+	}
+	when, err := http.ParseTime(value)
+	if err != nil || !when.After(now) {
+		return 0
+	}
+	return when.Sub(now)
+}
+
+func decodeErrorDetails(body []byte) any {
+	if len(bytes.TrimSpace(body)) == 0 {
+		return nil
+	}
+	var value any
+	if json.Unmarshal(body, &value) == nil {
+		return value
+	}
+	const maximum = 4096
+	if len(body) > maximum {
+		body = body[:maximum]
+	}
+	return strings.TrimSpace(string(body))
+}
+
+func errorDetailMessage(details any) string {
+	object, ok := details.(map[string]any)
+	if !ok {
+		if text, textOK := details.(string); textOK {
+			return text
+		}
+		return ""
+	}
+	if nested, nestedOK := object["error"].(map[string]any); nestedOK {
+		if message, messageOK := nested["message"].(string); messageOK {
+			return message
+		}
+	}
+	message, _ := object["message"].(string)
+	return message
+}
+
+func (e Executor) now() time.Time {
+	if e.Now != nil {
+		return e.Now()
+	}
+	return time.Now()
+}
+
+func (e Executor) sleep(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return nil
+	}
+	if e.Sleep != nil {
+		return e.Sleep(ctx, delay)
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func buildMultipartUpload(metadata any, uploadPath, explicitContentType string) ([]byte, string, error) {

@@ -2,15 +2,11 @@
 package main
 
 import (
-	"fmt"
 	"os"
 
 	"github.com/hairizuanbinnoorazman/gws-go/cmd"
 )
 
 func main() {
-	if err := cmd.Execute(); err != nil {
-		fmt.Fprintln(os.Stderr, "Error:", err)
-		os.Exit(1)
-	}
+	os.Exit(cmd.Run(os.Args[1:], os.Stdout, os.Stderr))
 }

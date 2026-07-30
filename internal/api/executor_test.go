@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"mime"
 	"mime/multipart"
@@ -11,7 +12,9 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/hairizuanbinnoorazman/gws-go/internal/clierr"
 	"github.com/hairizuanbinnoorazman/gws-go/internal/discovery"
 )
 
@@ -190,6 +193,91 @@ func TestExecutorRejectsUnsafeUploadContentType(t *testing.T) {
 	}
 }
 
+func TestExecutorValidatesRequestSchemaBeforeSending(t *testing.T) {
+	requested := false
+	client := &http.Client{Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		requested = true
+		return nil, errors.New("must not be called")
+	})}
+	doc := &discovery.Document{
+		BaseURL: "https://example.test/",
+		Schemas: map[string]*discovery.Schema{
+			"CreateItem": {
+				Type:     "object",
+				Required: []string{"name"},
+				Properties: map[string]*discovery.Schema{
+					"name": {Type: "string"},
+				},
+			},
+		},
+	}
+	err := (Executor{Client: client}).Execute(context.Background(), doc, &discovery.Method{
+		HTTPMethod: http.MethodPost,
+		Path:       "items",
+		Request:    &discovery.SchemaRef{Ref: "CreateItem"},
+	}, Options{BodyJSON: `{"name":42}`, Out: io.Discard})
+	var structured *clierr.Error
+	if !errors.As(err, &structured) || structured.Code != "request_validation_failed" {
+		t.Fatalf("error = %T %v", err, err)
+	}
+	if requested {
+		t.Fatal("request was sent despite validation failure")
+	}
+}
+
+func TestExecutorReadsJSONInputsFromStdinAndFiles(t *testing.T) {
+	directory := t.TempDir()
+	paramsPath := directory + "/params.json"
+	if err := os.WriteFile(paramsPath, []byte(`{"itemId":"item-1"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	doc := &discovery.Document{
+		BaseURL: "https://example.test/",
+		Schemas: map[string]*discovery.Schema{
+			"Item": {
+				Type: "object",
+				Properties: map[string]*discovery.Schema{
+					"name": {Type: "string"},
+				},
+			},
+		},
+	}
+	method := &discovery.Method{
+		HTTPMethod: http.MethodPatch,
+		Path:       "items/{itemId}",
+		Parameters: map[string]*discovery.Parameter{
+			"itemId": {Location: "path", Required: true},
+		},
+		Request: &discovery.SchemaRef{Ref: "Item"},
+	}
+	var output strings.Builder
+	err := (Executor{}).Execute(context.Background(), doc, method, Options{
+		ParamsFile: paramsPath,
+		BodyJSON:   "-",
+		Input:      strings.NewReader(`{"name":"Updated"}`),
+		DryRun:     true,
+		Out:        &output,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), `/items/item-1`) || !strings.Contains(output.String(), `"Updated"`) {
+		t.Fatalf("output = %q", output.String())
+	}
+}
+
+func TestExecutorRejectsMultipleStdinInputs(t *testing.T) {
+	err := (Executor{}).Execute(context.Background(), &discovery.Document{}, &discovery.Method{}, Options{
+		ParamsJSON: "-",
+		BodyFile:   "-",
+		Input:      strings.NewReader(`{}`),
+		DryRun:     true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "only one JSON input") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 func multipartUploadMethod() *discovery.Method {
 	return &discovery.Method{
 		HTTPMethod:          http.MethodPost,
@@ -226,6 +314,90 @@ func TestExecutorPaginates(t *testing.T) {
 	}
 	if requests != 2 || !strings.Contains(out.String(), `"items"`) {
 		t.Fatalf("requests=%d output=%q", requests, out.String())
+	}
+}
+
+func TestExecutorRetriesWithExponentialBackoffAndRetryAfter(t *testing.T) {
+	requests := 0
+	var delays []time.Duration
+	client := &http.Client{Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		requests++
+		status := http.StatusServiceUnavailable
+		headers := make(http.Header)
+		if requests == 2 {
+			headers.Set("Retry-After", "3")
+		}
+		body := `{"error":{"message":"try again"}}`
+		if requests == 3 {
+			status = http.StatusOK
+			body = `{"ok":true}`
+		}
+		return &http.Response{
+			StatusCode: status,
+			Header:     headers,
+			Body:       io.NopCloser(strings.NewReader(body)),
+		}, nil
+	})}
+	executor := Executor{
+		Client: client,
+		Sleep: func(_ context.Context, delay time.Duration) error {
+			delays = append(delays, delay)
+			return nil
+		},
+	}
+	err := executor.Execute(context.Background(),
+		&discovery.Document{BaseURL: "https://example.test/"},
+		&discovery.Method{HTTPMethod: http.MethodGet, Path: "items"},
+		Options{MaxRetries: 2, RetryDelay: time.Second, Out: io.Discard},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if requests != 3 {
+		t.Fatalf("requests = %d, want 3", requests)
+	}
+	if len(delays) != 2 || delays[0] != time.Second || delays[1] != 3*time.Second {
+		t.Fatalf("delays = %#v", delays)
+	}
+}
+
+func TestExecutorReturnsStructuredAPIErrorAfterRetries(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"quota exhausted"}}`)),
+		}, nil
+	})}
+	err := (Executor{Client: client}).Execute(context.Background(),
+		&discovery.Document{BaseURL: "https://example.test/"},
+		&discovery.Method{HTTPMethod: http.MethodGet, Path: "items"},
+		Options{MaxRetries: 1, Out: io.Discard},
+	)
+	var structured *clierr.Error
+	if !errors.As(err, &structured) {
+		t.Fatalf("expected structured error, got %T: %v", err, err)
+	}
+	if structured.Status != http.StatusTooManyRequests || structured.Attempts != 2 || !structured.Retryable {
+		t.Fatalf("unexpected structured error: %#v", structured)
+	}
+	if clierr.ExitCode(err) != clierr.ExitAPI || !strings.Contains(err.Error(), "quota exhausted") {
+		t.Fatalf("exit=%d error=%v", clierr.ExitCode(err), err)
+	}
+}
+
+func TestExecutorRequestTimeout(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		<-r.Context().Done()
+		return nil, r.Context().Err()
+	})}
+	err := (Executor{Client: client}).Execute(context.Background(),
+		&discovery.Document{BaseURL: "https://example.test/"},
+		&discovery.Method{HTTPMethod: http.MethodGet, Path: "items"},
+		Options{RequestTimeout: time.Millisecond, Out: io.Discard},
+	)
+	if clierr.ExitCode(err) != clierr.ExitTimeout {
+		t.Fatalf("exit=%d error=%v", clierr.ExitCode(err), err)
 	}
 }
 

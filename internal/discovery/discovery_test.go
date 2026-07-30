@@ -2,6 +2,7 @@ package discovery
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/hairizuanbinnoorazman/gws-go/internal/clierr"
 	appconfig "github.com/hairizuanbinnoorazman/gws-go/internal/config"
 )
 
@@ -42,6 +44,17 @@ func TestLoaderFetchesThenCaches(t *testing.T) {
 	dir, _ := appconfig.Dir()
 	if info, err := os.Stat(filepath.Join(dir, "cache", "drive_v3.json")); err != nil || info.Mode().Perm() != 0o600 {
 		t.Fatalf("cache info=%v err=%v", info, err)
+	}
+}
+
+func TestLoaderClassifiesNetworkErrors(t *testing.T) {
+	t.Setenv(appconfig.DirEnv, t.TempDir())
+	client := &http.Client{Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		return nil, errors.New("offline")
+	})}
+	_, err := (Loader{Client: client, BaseURL: "https://discovery.example.test"}).Load(context.Background(), "drive", "v3")
+	if clierr.ExitCode(err) != clierr.ExitNetwork {
+		t.Fatalf("exit=%d error=%v", clierr.ExitCode(err), err)
 	}
 }
 

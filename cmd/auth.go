@@ -19,26 +19,39 @@ func newLoginCommand(out io.Writer) *cobra.Command {
 	var clientSecret string
 	var noBrowser bool
 	var scopes string
+	var scopePreset string
 	var timeout time.Duration
 	command := &cobra.Command{
 		Use:   "login",
 		Short: "Authorize offline access and save a refresh token",
 		Args:  cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) error {
+			if scopes != "" && command.Flags().Changed("scope-preset") {
+				return fmt.Errorf("--scopes and --scope-preset cannot be combined")
+			}
+			selectedScopes := auth.ParseScopes(scopes)
+			if scopes == "" {
+				var err error
+				selectedScopes, err = auth.ScopesForPreset(scopePreset)
+				if err != nil {
+					return err
+				}
+			}
 			ctx, cancel := contextWithTimeout(command.Context(), timeout)
 			defer cancel()
 			return auth.Login(ctx, auth.LoginOptions{
 				ClientSecretFile: clientSecret,
 				NoBrowser:        noBrowser,
 				Timeout:          timeout,
-				Scopes:           auth.ParseScopes(scopes),
+				Scopes:           selectedScopes,
 				Out:              out,
 			})
 		},
 	}
 	command.Flags().StringVar(&clientSecret, "client-secret", "", "path to a Google Desktop OAuth client JSON file")
 	command.Flags().BoolVar(&noBrowser, "no-browser", false, "print the authorization URL without opening a browser")
-	command.Flags().StringVar(&scopes, "scopes", "", "comma-separated OAuth scope URLs (defaults to Docs, Calendar, Slides, Drive, and read-only Gmail)")
+	command.Flags().StringVar(&scopes, "scopes", "", "comma-separated OAuth scope URLs (defaults to all supported services and read-only Gmail)")
+	command.Flags().StringVar(&scopePreset, "scope-preset", "standard", "OAuth scope preset: standard or gmail-write")
 	command.Flags().DurationVar(&timeout, "timeout", 5*time.Minute, "maximum time to wait for the browser callback")
 	return command
 }

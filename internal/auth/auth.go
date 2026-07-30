@@ -35,7 +35,31 @@ var DefaultScopes = []string{
 	"https://www.googleapis.com/auth/presentations",
 	"https://www.googleapis.com/auth/gmail.readonly",
 	"https://www.googleapis.com/auth/drive",
+	"https://www.googleapis.com/auth/spreadsheets",
 	"https://www.googleapis.com/auth/photospicker.mediaitems.readonly",
+}
+
+// ScopesForPreset returns a copy of the scopes granted by a named login preset.
+// Gmail write access is never included in the default standard preset.
+func ScopesForPreset(name string) ([]string, error) {
+	if name == "" || name == "standard" {
+		return append([]string(nil), DefaultScopes...), nil
+	}
+	if name != "gmail-write" {
+		return nil, fmt.Errorf("unknown scope preset %q; use standard or gmail-write", name)
+	}
+	result := make([]string, 0, len(DefaultScopes)+1)
+	for _, scope := range DefaultScopes {
+		if scope == "https://www.googleapis.com/auth/gmail.readonly" {
+			result = append(result,
+				"https://www.googleapis.com/auth/gmail.modify",
+				"https://www.googleapis.com/auth/gmail.send",
+			)
+			continue
+		}
+		result = append(result, scope)
+	}
+	return result, nil
 }
 
 // ClientFile models the OAuth client JSON downloaded from Google Cloud.
