@@ -4,6 +4,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,25 +29,31 @@ import (
 
 // Options contains inputs shared by dynamically discovered API methods.
 type Options struct {
-	ParamsJSON        string
-	BodyJSON          string
-	OutputPath        string
-	UploadPath        string
-	UploadContentType string
-	ParamsFile        string
-	BodyFile          string
-	Input             io.Reader
-	DryRun            bool
-	PageAll           bool
-	PageLimit         int
-	PageDelay         time.Duration
-	RequestTimeout    time.Duration
-	MaxRetries        int
-	RetryDelay        time.Duration
-	Format            string
-	Fields            string
-	Quiet             bool
-	Out               io.Writer
+	ParamsJSON         string
+	ParameterOverrides map[string]any
+	BodyJSON           string
+	OutputPath         string
+	UploadPath         string
+	UploadContentType  string
+	ResumableUpload    bool
+	UploadChunkSize    int64
+	ParamsFile         string
+	BodyFile           string
+	Input              io.Reader
+	DryRun             bool
+	PageAll            bool
+	PageLimit          int
+	PageDelay          time.Duration
+	RequestTimeout     time.Duration
+	MaxRetries         int
+	RetryDelay         time.Duration
+	RetryUnsafe        bool
+	ShowProgress       bool
+	ProgressOut        io.Writer
+	Format             string
+	Fields             string
+	Quiet              bool
+	Out                io.Writer
 }
 
 // Executor sends requests to a Google Workspace REST API.
@@ -62,6 +69,9 @@ var templatePattern = regexp.MustCompile(`\{(\+?)([^}]+)\}`)
 func (e Executor) Execute(ctx context.Context, doc *discovery.Document, method *discovery.Method, opts Options) error {
 	if opts.Out == nil {
 		opts.Out = os.Stdout
+	}
+	if opts.ShowProgress && opts.ProgressOut == nil {
+		opts.ProgressOut = os.Stderr
 	}
 	if opts.PageLimit <= 0 {
 		opts.PageLimit = 10
@@ -83,6 +93,9 @@ func (e Executor) Execute(ctx context.Context, doc *discovery.Document, method *
 	if err != nil {
 		return clierr.New("invalid_argument", err.Error(), clierr.ExitInput, nil)
 	}
+	for name, value := range opts.ParameterOverrides {
+		params[name] = value
+	}
 	body, err := parseBody(bodyJSON)
 	if err != nil {
 		return clierr.New("invalid_argument", err.Error(), clierr.ExitInput, nil)
@@ -96,7 +109,10 @@ func (e Executor) Execute(ctx context.Context, doc *discovery.Document, method *
 	}
 	var uploadInfo map[string]any
 	if isUpload {
-		if !supportsMultipartUpload(method) {
+		if opts.ResumableUpload && !supportsResumableUpload(method) {
+			return errors.New("this API method does not support resumable media upload")
+		}
+		if !opts.ResumableUpload && !supportsMultipartUpload(method) {
 			return errors.New("this API method does not support multipart media upload")
 		}
 		info, statErr := os.Stat(opts.UploadPath)
@@ -116,9 +132,28 @@ func (e Executor) Execute(ctx context.Context, doc *discovery.Document, method *
 			"path":         opts.UploadPath,
 		}
 	}
-	requestURL, err := buildURL(doc, method, params, isUpload)
-	if err != nil {
-		return clierr.New("invalid_argument", err.Error(), clierr.ExitInput, nil)
+	var requestURL string
+	if opts.ResumableUpload {
+		if !isUpload {
+			return clierr.New("invalid_argument", "--resumable requires --upload", clierr.ExitInput, nil)
+		}
+		requestURL, err = buildResumableUploadURL(doc, method, params)
+		if err != nil {
+			return clierr.New("invalid_argument", err.Error(), clierr.ExitInput, nil)
+		}
+		if opts.UploadChunkSize == 0 {
+			opts.UploadChunkSize = 8 << 20
+		}
+		if opts.UploadChunkSize <= 0 || opts.UploadChunkSize%(256<<10) != 0 {
+			return clierr.New("invalid_argument", "--upload-chunk-size must be a positive multiple of 256 KiB", clierr.ExitInput, nil)
+		}
+		uploadInfo["resumable"] = true
+		uploadInfo["chunk_size"] = opts.UploadChunkSize
+	} else {
+		requestURL, err = buildURL(doc, method, params, isUpload)
+		if err != nil {
+			return clierr.New("invalid_argument", err.Error(), clierr.ExitInput, nil)
+		}
 	}
 	if opts.DryRun {
 		preview := map[string]any{
@@ -132,11 +167,41 @@ func (e Executor) Execute(ctx context.Context, doc *discovery.Document, method *
 	if e.Client == nil {
 		return errors.New("HTTP client is required")
 	}
+	if opts.ResumableUpload {
+		responseBody, contentType, err := e.resumableUpload(ctx, method, requestURL, body, opts)
+		if err != nil {
+			return err
+		}
+		if opts.OutputPath != "" {
+			written, checksum, writeErr := saveResponseFile(opts.OutputPath, bytes.NewReader(responseBody), opts.ProgressOut)
+			if writeErr != nil {
+				return clierr.New("filesystem_error", "write output file", clierr.ExitFilesystem, writeErr)
+			}
+			return writeJSON(opts.Out, map[string]any{
+				"bytes": written, "content_type": contentType, "saved_file": opts.OutputPath, "sha256": checksum,
+			})
+		}
+		if len(bytes.TrimSpace(responseBody)) == 0 {
+			return nil
+		}
+		var value any
+		if json.Unmarshal(responseBody, &value) != nil {
+			if _, err := fmt.Fprintln(opts.Out, string(responseBody)); err != nil {
+				return err
+			}
+			return nil
+		}
+		_ = contentType
+		if err := renderOutput(opts.Out, value, opts); err != nil {
+			return clierr.New("output_format_error", "render response", clierr.ExitInput, err)
+		}
+		return nil
+	}
 
 	pageURL := requestURL
 	var pageValues []any
 	for page := 1; ; page++ {
-		responseBody, contentType, err := e.request(ctx, method, pageURL, body, opts)
+		responseBody, contentType, savedBytes, checksum, err := e.request(ctx, method, pageURL, body, opts)
 		if err != nil {
 			return err
 		}
@@ -144,10 +209,9 @@ func (e Executor) Execute(ctx context.Context, doc *discovery.Document, method *
 			if opts.PageAll {
 				return errors.New("--output cannot be combined with --page-all")
 			}
-			if err := os.WriteFile(opts.OutputPath, responseBody, 0o600); err != nil {
-				return fmt.Errorf("write output file: %w", err)
-			}
-			return writeJSON(opts.Out, map[string]any{"bytes": len(responseBody), "content_type": contentType, "saved_file": opts.OutputPath})
+			return writeJSON(opts.Out, map[string]any{
+				"bytes": savedBytes, "content_type": contentType, "saved_file": opts.OutputPath, "sha256": checksum,
+			})
 		}
 		if len(bytes.TrimSpace(responseBody)) == 0 {
 			return nil
@@ -263,23 +327,16 @@ func resolveJSONInput(inline, path, inlineFlag, fileFlag string, input io.Reader
 	return string(data), nil
 }
 
-func (e Executor) request(ctx context.Context, method *discovery.Method, requestURL string, body any, opts Options) ([]byte, string, error) {
+func (e Executor) request(ctx context.Context, method *discovery.Method, requestURL string, body any, opts Options) ([]byte, string, int64, string, error) {
 	var encodedBody []byte
-	contentType := ""
-	if opts.UploadPath != "" {
-		encoded, multipartType, err := buildMultipartUpload(body, opts.UploadPath, opts.UploadContentType)
+	if opts.UploadPath == "" && body != nil {
+		var err error
+		encodedBody, err = json.Marshal(body)
 		if err != nil {
-			return nil, "", err
+			return nil, "", 0, "", err
 		}
-		encodedBody = encoded
-		contentType = multipartType
-	} else if body != nil {
-		encoded, err := json.Marshal(body)
-		if err != nil {
-			return nil, "", err
-		}
-		encodedBody = encoded
 	}
+	retryAllowed := requestMayRetry(method.HTTPMethod, requestURL, opts.RetryUnsafe)
 
 	for attempt := 0; ; attempt++ {
 		requestCtx := ctx
@@ -288,13 +345,27 @@ func (e Executor) request(ctx context.Context, method *discovery.Method, request
 			requestCtx, cancel = context.WithTimeout(ctx, opts.RequestTimeout)
 		}
 		var reader io.Reader
-		if encodedBody != nil {
+		var bodyCloser io.Closer
+		contentType := ""
+		if opts.UploadPath != "" {
+			uploadReader, multipartType, err := newMultipartUploadReader(body, opts.UploadPath, opts.UploadContentType, opts.ProgressOut)
+			if err != nil {
+				cancel()
+				return nil, "", 0, "", err
+			}
+			reader = uploadReader
+			bodyCloser = uploadReader
+			contentType = multipartType
+		} else if encodedBody != nil {
 			reader = bytes.NewReader(encodedBody)
 		}
 		req, err := http.NewRequestWithContext(requestCtx, method.HTTPMethod, requestURL, reader)
 		if err != nil {
+			if bodyCloser != nil {
+				_ = bodyCloser.Close()
+			}
 			cancel()
-			return nil, "", err
+			return nil, "", 0, "", err
 		}
 		if contentType != "" {
 			req.Header.Set("Content-Type", contentType)
@@ -304,33 +375,57 @@ func (e Executor) request(ctx context.Context, method *discovery.Method, request
 		req.Header.Set("Accept", "application/json")
 		resp, err := e.Client.Do(req)
 		if err != nil {
+			if bodyCloser != nil {
+				_ = bodyCloser.Close()
+			}
 			cancel()
 			if errors.Is(err, context.DeadlineExceeded) || errors.Is(requestCtx.Err(), context.DeadlineExceeded) {
-				return nil, "", clierr.New("request_timeout", "Google API request timed out", clierr.ExitTimeout, err)
+				return nil, "", 0, "", clierr.New("request_timeout", "Google API request timed out", clierr.ExitTimeout, err)
 			}
-			return nil, "", clierr.New("network_error", "Google API request failed", clierr.ExitNetwork, err)
+			if retryAllowed && attempt < opts.MaxRetries {
+				if sleepErr := e.sleep(ctx, retryBackoff(opts.RetryDelay, attempt)); sleepErr != nil {
+					return nil, "", 0, "", sleepErr
+				}
+				continue
+			}
+			return nil, "", 0, "", clierr.New("network_error", "Google API request failed", clierr.ExitNetwork, err)
+		}
+		if bodyCloser != nil {
+			_ = bodyCloser.Close()
+		}
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 && opts.OutputPath != "" {
+			written, checksum, writeErr := saveResponseFile(opts.OutputPath, resp.Body, opts.ProgressOut)
+			closeErr := resp.Body.Close()
+			cancel()
+			if writeErr != nil {
+				return nil, "", 0, "", clierr.New("filesystem_error", "write output file", clierr.ExitFilesystem, writeErr)
+			}
+			if closeErr != nil {
+				return nil, "", 0, "", clierr.New("network_error", "close Google API response", clierr.ExitNetwork, closeErr)
+			}
+			return nil, resp.Header.Get("Content-Type"), written, checksum, nil
 		}
 		responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 		closeErr := resp.Body.Close()
 		cancel()
 		if readErr != nil {
-			return nil, "", clierr.New("network_error", "read Google API response", clierr.ExitNetwork, readErr)
+			return nil, "", 0, "", clierr.New("network_error", "read Google API response", clierr.ExitNetwork, readErr)
 		}
 		if closeErr != nil {
-			return nil, "", clierr.New("network_error", "close Google API response", clierr.ExitNetwork, closeErr)
+			return nil, "", 0, "", clierr.New("network_error", "close Google API response", clierr.ExitNetwork, closeErr)
 		}
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			return responseBody, resp.Header.Get("Content-Type"), nil
+			return responseBody, resp.Header.Get("Content-Type"), int64(len(responseBody)), "", nil
 		}
 
 		retryable := retryableStatus(resp.StatusCode)
-		if retryable && attempt < opts.MaxRetries {
+		if retryable && retryAllowed && attempt < opts.MaxRetries {
 			delay := retryBackoff(opts.RetryDelay, attempt)
 			if retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"), e.now()); retryAfter > delay {
 				delay = retryAfter
 			}
 			if err := e.sleep(ctx, delay); err != nil {
-				return nil, "", err
+				return nil, "", 0, "", err
 			}
 			continue
 		}
@@ -344,8 +439,28 @@ func (e Executor) request(ctx context.Context, method *discovery.Method, request
 		apiError.Retryable = retryable
 		apiError.Attempts = attempt + 1
 		apiError.Details = details
-		return nil, "", apiError
+		return nil, "", 0, "", apiError
 	}
+}
+
+func requestMayRetry(method, requestURL string, unsafe bool) bool {
+	if unsafe {
+		return true
+	}
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodPut, http.MethodDelete:
+		return true
+	}
+	parsed, err := url.Parse(requestURL)
+	if err != nil {
+		return false
+	}
+	for _, name := range []string{"requestId", "request_id"} {
+		if parsed.Query().Get(name) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func retryableStatus(status int) bool {
@@ -450,13 +565,11 @@ func (e Executor) sleep(ctx context.Context, delay time.Duration) error {
 	}
 }
 
-func buildMultipartUpload(metadata any, uploadPath, explicitContentType string) ([]byte, string, error) {
-	file, err := os.Open(uploadPath)
+func (e Executor) resumableUpload(ctx context.Context, method *discovery.Method, requestURL string, metadata any, opts Options) ([]byte, string, error) {
+	info, err := os.Stat(opts.UploadPath)
 	if err != nil {
-		return nil, "", fmt.Errorf("open upload file: %w", err)
+		return nil, "", fmt.Errorf("inspect upload file: %w", err)
 	}
-	defer func() { _ = file.Close() }()
-
 	metadataJSON := []byte("{}")
 	if metadata != nil {
 		metadataJSON, err = json.Marshal(metadata)
@@ -464,36 +577,313 @@ func buildMultipartUpload(metadata any, uploadPath, explicitContentType string) 
 			return nil, "", fmt.Errorf("encode upload metadata: %w", err)
 		}
 	}
-
-	var body bytes.Buffer
-	writer := multipart.NewWriter(&body)
-	metadataHeaders := make(textproto.MIMEHeader)
-	metadataHeaders.Set("Content-Type", "application/json; charset=UTF-8")
-	metadataPart, err := writer.CreatePart(metadataHeaders)
-	if err != nil {
-		return nil, "", fmt.Errorf("create upload metadata part: %w", err)
+	mediaType := resolveUploadContentType(metadata, opts.UploadPath, opts.UploadContentType)
+	if err := validateUploadContentType(mediaType); err != nil {
+		return nil, "", err
 	}
-	if _, err := metadataPart.Write(metadataJSON); err != nil {
-		return nil, "", fmt.Errorf("write upload metadata part: %w", err)
+
+	var sessionURL string
+	for attempt := 0; ; attempt++ {
+		requestCtx, cancel := requestAttemptContext(ctx, opts.RequestTimeout)
+		req, requestErr := http.NewRequestWithContext(requestCtx, method.HTTPMethod, requestURL, bytes.NewReader(metadataJSON))
+		if requestErr != nil {
+			cancel()
+			return nil, "", requestErr
+		}
+		req.Header.Set("Content-Type", "application/json; charset=UTF-8")
+		req.Header.Set("X-Upload-Content-Type", mediaType)
+		req.Header.Set("X-Upload-Content-Length", strconv.FormatInt(info.Size(), 10))
+		resp, requestErr := e.Client.Do(req)
+		if requestErr != nil {
+			cancel()
+			if isRequestTimeout(requestCtx, requestErr) {
+				return nil, "", clierr.New("request_timeout", "resumable upload initialization timed out", clierr.ExitTimeout, requestErr)
+			}
+			if requestMayRetry(method.HTTPMethod, requestURL, opts.RetryUnsafe) && attempt < opts.MaxRetries {
+				if sleepErr := e.sleep(ctx, retryBackoff(opts.RetryDelay, attempt)); sleepErr != nil {
+					return nil, "", sleepErr
+				}
+				continue
+			}
+			return nil, "", clierr.New("network_error", "initialize resumable upload", clierr.ExitNetwork, requestErr)
+		}
+		responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		closeErr := resp.Body.Close()
+		cancel()
+		if readErr != nil || closeErr != nil {
+			if readErr == nil {
+				readErr = closeErr
+			}
+			return nil, "", clierr.New("network_error", "read resumable upload initialization", clierr.ExitNetwork, readErr)
+		}
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			sessionURL = resp.Header.Get("Location")
+			if sessionURL == "" {
+				return nil, "", clierr.New("invalid_response", "resumable upload response did not include a Location header", clierr.ExitAPI, nil)
+			}
+			break
+		}
+		retryable := retryableStatus(resp.StatusCode)
+		if retryable && requestMayRetry(method.HTTPMethod, requestURL, opts.RetryUnsafe) && attempt < opts.MaxRetries {
+			delay := retryBackoff(opts.RetryDelay, attempt)
+			if retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"), e.now()); retryAfter > delay {
+				delay = retryAfter
+			}
+			if sleepErr := e.sleep(ctx, delay); sleepErr != nil {
+				return nil, "", sleepErr
+			}
+			continue
+		}
+		return nil, "", googleAPIError(resp.StatusCode, responseBody, retryable, attempt+1)
+	}
+
+	file, err := os.Open(opts.UploadPath)
+	if err != nil {
+		return nil, "", fmt.Errorf("open upload file: %w", err)
+	}
+	defer func() { _ = file.Close() }()
+	size := info.Size()
+	offset := int64(0)
+	first := true
+	for offset < size || first {
+		first = false
+		chunkSize := opts.UploadChunkSize
+		if remaining := size - offset; remaining < chunkSize {
+			chunkSize = remaining
+		}
+		if size == 0 {
+			chunkSize = 0
+		}
+		for attempt := 0; ; attempt++ {
+			requestCtx, cancel := requestAttemptContext(ctx, opts.RequestTimeout)
+			reader := io.NewSectionReader(file, offset, chunkSize)
+			req, requestErr := http.NewRequestWithContext(requestCtx, http.MethodPut, sessionURL, reader)
+			if requestErr != nil {
+				cancel()
+				return nil, "", requestErr
+			}
+			req.ContentLength = chunkSize
+			req.Header.Set("Content-Type", mediaType)
+			if size == 0 {
+				req.Header.Set("Content-Range", "bytes */0")
+			} else {
+				req.Header.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", offset, offset+chunkSize-1, size))
+			}
+			resp, requestErr := e.Client.Do(req)
+			if requestErr != nil {
+				cancel()
+				if isRequestTimeout(requestCtx, requestErr) {
+					return nil, "", clierr.New("request_timeout", "resumable upload chunk timed out", clierr.ExitTimeout, requestErr)
+				}
+				if attempt < opts.MaxRetries {
+					if sleepErr := e.sleep(ctx, retryBackoff(opts.RetryDelay, attempt)); sleepErr != nil {
+						return nil, "", sleepErr
+					}
+					continue
+				}
+				return nil, "", clierr.New("network_error", "upload resumable chunk", clierr.ExitNetwork, requestErr)
+			}
+			responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+			closeErr := resp.Body.Close()
+			cancel()
+			if readErr != nil || closeErr != nil {
+				if readErr == nil {
+					readErr = closeErr
+				}
+				return nil, "", clierr.New("network_error", "read resumable upload response", clierr.ExitNetwork, readErr)
+			}
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				if opts.ProgressOut != nil {
+					_, _ = fmt.Fprintf(opts.ProgressOut, "Uploaded %d bytes\n", size)
+				}
+				return responseBody, resp.Header.Get("Content-Type"), nil
+			}
+			if resp.StatusCode == 308 {
+				offset = nextUploadOffset(resp.Header.Get("Range"), offset+chunkSize)
+				if opts.ProgressOut != nil {
+					_, _ = fmt.Fprintf(opts.ProgressOut, "Uploaded %d of %d bytes\n", offset, size)
+				}
+				break
+			}
+			retryable := retryableStatus(resp.StatusCode)
+			if retryable && attempt < opts.MaxRetries {
+				delay := retryBackoff(opts.RetryDelay, attempt)
+				if retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"), e.now()); retryAfter > delay {
+					delay = retryAfter
+				}
+				if sleepErr := e.sleep(ctx, delay); sleepErr != nil {
+					return nil, "", sleepErr
+				}
+				continue
+			}
+			return nil, "", googleAPIError(resp.StatusCode, responseBody, retryable, attempt+1)
+		}
+	}
+	return nil, "", clierr.New("invalid_response", "resumable upload ended without a final response", clierr.ExitAPI, nil)
+}
+
+func requestAttemptContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout > 0 {
+		return context.WithTimeout(ctx, timeout)
+	}
+	return ctx, func() {}
+}
+
+func isRequestTimeout(ctx context.Context, err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded)
+}
+
+func nextUploadOffset(header string, fallback int64) int64 {
+	header = strings.TrimSpace(header)
+	if !strings.HasPrefix(header, "bytes=0-") {
+		return fallback
+	}
+	last, err := strconv.ParseInt(strings.TrimPrefix(header, "bytes=0-"), 10, 64)
+	if err != nil || last < 0 {
+		return fallback
+	}
+	return last + 1
+}
+
+func googleAPIError(status int, body []byte, retryable bool, attempts int) error {
+	details := decodeErrorDetails(body)
+	message := fmt.Sprintf("Google API returned HTTP %d", status)
+	if detailMessage := errorDetailMessage(details); detailMessage != "" {
+		message += ": " + detailMessage
+	}
+	apiError := clierr.New("google_api_error", message, clierr.ExitAPI, nil)
+	apiError.Status = status
+	apiError.Retryable = retryable
+	apiError.Attempts = attempts
+	apiError.Details = details
+	return apiError
+}
+
+func newMultipartUploadReader(metadata any, uploadPath, explicitContentType string, progressOut io.Writer) (*io.PipeReader, string, error) {
+	file, err := os.Open(uploadPath)
+	if err != nil {
+		return nil, "", fmt.Errorf("open upload file: %w", err)
+	}
+
+	metadataJSON := []byte("{}")
+	if metadata != nil {
+		metadataJSON, err = json.Marshal(metadata)
+		if err != nil {
+			_ = file.Close()
+			return nil, "", fmt.Errorf("encode upload metadata: %w", err)
+		}
 	}
 
 	mediaContentType := resolveUploadContentType(metadata, uploadPath, explicitContentType)
 	if err := validateUploadContentType(mediaContentType); err != nil {
+		_ = file.Close()
 		return nil, "", err
 	}
-	mediaHeaders := make(textproto.MIMEHeader)
-	mediaHeaders.Set("Content-Type", mediaContentType)
-	mediaPart, err := writer.CreatePart(mediaHeaders)
+
+	reader, pipeWriter := io.Pipe()
+	writer := multipart.NewWriter(pipeWriter)
+	contentType := "multipart/related; boundary=" + writer.Boundary()
+	go func() {
+		defer func() { _ = file.Close() }()
+		fail := func(writeErr error) {
+			_ = pipeWriter.CloseWithError(writeErr)
+		}
+		metadataHeaders := make(textproto.MIMEHeader)
+		metadataHeaders.Set("Content-Type", "application/json; charset=UTF-8")
+		metadataPart, writeErr := writer.CreatePart(metadataHeaders)
+		if writeErr != nil {
+			fail(fmt.Errorf("create upload metadata part: %w", writeErr))
+			return
+		}
+		if _, writeErr = metadataPart.Write(metadataJSON); writeErr != nil {
+			fail(fmt.Errorf("write upload metadata part: %w", writeErr))
+			return
+		}
+		mediaHeaders := make(textproto.MIMEHeader)
+		mediaHeaders.Set("Content-Type", mediaContentType)
+		mediaPart, writeErr := writer.CreatePart(mediaHeaders)
+		if writeErr != nil {
+			fail(fmt.Errorf("create upload media part: %w", writeErr))
+			return
+		}
+		source := io.Reader(file)
+		if progressOut != nil {
+			source = io.TeeReader(file, newProgressWriter(progressOut, "Uploaded"))
+		}
+		if _, writeErr = io.Copy(mediaPart, source); writeErr != nil {
+			fail(fmt.Errorf("write upload media part: %w", writeErr))
+			return
+		}
+		if writeErr = writer.Close(); writeErr != nil {
+			fail(fmt.Errorf("finish multipart upload: %w", writeErr))
+			return
+		}
+		_ = pipeWriter.Close()
+	}()
+	return reader, contentType, nil
+}
+
+func saveResponseFile(path string, source io.Reader, progressOut io.Writer) (written int64, checksum string, resultErr error) {
+	dir := filepath.Dir(path)
+	temp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
 	if err != nil {
-		return nil, "", fmt.Errorf("create upload media part: %w", err)
+		return 0, "", err
 	}
-	if _, err := io.Copy(mediaPart, file); err != nil {
-		return nil, "", fmt.Errorf("write upload media part: %w", err)
+	tempPath := temp.Name()
+	defer func() {
+		_ = temp.Close()
+		if resultErr != nil {
+			_ = os.Remove(tempPath)
+		}
+	}()
+	if err := temp.Chmod(0o600); err != nil {
+		return 0, "", err
 	}
-	if err := writer.Close(); err != nil {
-		return nil, "", fmt.Errorf("finish multipart upload: %w", err)
+	hash := sha256.New()
+	target := io.Writer(io.MultiWriter(temp, hash))
+	if progressOut != nil {
+		target = newProgressWriterWithTarget(target, progressOut, "Downloaded")
 	}
-	return body.Bytes(), "multipart/related; boundary=" + writer.Boundary(), nil
+	written, err = io.Copy(target, source)
+	if err != nil {
+		return 0, "", err
+	}
+	if err := temp.Sync(); err != nil {
+		return 0, "", err
+	}
+	if err := temp.Close(); err != nil {
+		return 0, "", err
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		return 0, "", err
+	}
+	return written, fmt.Sprintf("%x", hash.Sum(nil)), nil
+}
+
+type progressWriter struct {
+	target io.Writer
+	out    io.Writer
+	label  string
+	total  int64
+	next   int64
+}
+
+func newProgressWriter(out io.Writer, label string) io.Writer {
+	return newProgressWriterWithTarget(io.Discard, out, label)
+}
+
+func newProgressWriterWithTarget(target, out io.Writer, label string) io.Writer {
+	return &progressWriter{target: target, out: out, label: label, next: 8 << 20}
+}
+
+func (writer *progressWriter) Write(data []byte) (int, error) {
+	count, err := writer.target.Write(data)
+	writer.total += int64(count)
+	if writer.total >= writer.next {
+		_, _ = fmt.Fprintf(writer.out, "%s %d bytes\n", writer.label, writer.total)
+		writer.next = writer.total + (8 << 20)
+	}
+	return count, err
 }
 
 func resolveUploadContentType(metadata any, uploadPath, explicit string) string {
@@ -523,6 +913,36 @@ func validateUploadContentType(value string) error {
 
 func supportsMultipartUpload(method *discovery.Method) bool {
 	return method.SupportsMediaUpload && method.MediaUpload != nil && method.MediaUpload.Protocols.Simple != nil && method.MediaUpload.Protocols.Simple.Multipart && method.MediaUpload.Protocols.Simple.Path != ""
+}
+
+func supportsResumableUpload(method *discovery.Method) bool {
+	return method.SupportsMediaUpload && method.MediaUpload != nil && method.MediaUpload.Protocols.Resumable != nil && method.MediaUpload.Protocols.Resumable.Path != ""
+}
+
+func buildResumableUploadURL(doc *discovery.Document, method *discovery.Method, params map[string]any) (string, error) {
+	if !supportsResumableUpload(method) {
+		return "", errors.New("this API method does not support resumable media upload")
+	}
+	methodCopy := *method
+	uploadCopy := *method.MediaUpload
+	protocolsCopy := method.MediaUpload.Protocols
+	resumableCopy := *protocolsCopy.Resumable
+	resumableCopy.Multipart = true
+	protocolsCopy.Simple = &resumableCopy
+	uploadCopy.Protocols = protocolsCopy
+	methodCopy.MediaUpload = &uploadCopy
+	requestURL, err := buildURL(doc, &methodCopy, params, true)
+	if err != nil {
+		return "", err
+	}
+	parsed, err := url.Parse(requestURL)
+	if err != nil {
+		return "", err
+	}
+	query := parsed.Query()
+	query.Set("uploadType", "resumable")
+	parsed.RawQuery = query.Encode()
+	return parsed.String(), nil
 }
 
 // BuildURL renders path parameters and encodes query parameters for a method.

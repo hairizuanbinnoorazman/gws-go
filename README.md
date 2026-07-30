@@ -137,9 +137,14 @@ bin/gws-go drive files create \
   --json '{"name":"report.pdf"}' \
   --upload ./report.pdf
 
+# Upload a large file in resumable chunks
+bin/gws-go drive upload --file ./archive.zip --resumable
+
 # Task-oriented Drive transfer and sharing helpers
 bin/gws-go drive upload --file ./report.pdf --folder FOLDER_ID
 bin/gws-go drive download --file FILE_ID --output ./report.pdf
+# Google Docs, Sheets, Slides, and Drawings are exported automatically
+bin/gws-go drive download --file GOOGLE_DOC_ID --output ./report.docx
 bin/gws-go drive share --file FILE_ID \
   --email ada@example.com --role writer
 
@@ -158,8 +163,14 @@ bin/gws-go drive files get \
   --error-format json
 ```
 
-All methods accept `--params` for path/query parameters. Method help lists
-parameter types, required parameters, enum values, and a generated example.
+All methods expose Discovery parameters as native kebab-case flags, such as
+`--calendar-id`, `--max-results`, and repeatable `--label-ids` flags. Names that
+conflict with gws-go output or execution flags receive an `--api-` prefix; for
+example, Google's partial-response `fields` parameter is `--api-fields`, while
+`--fields` continues to select fields locally. `--params` remains available for
+JSON path/query parameters, and explicitly supplied native flags override its
+values. Method help lists parameter types, required parameters, enum values, and
+a generated example.
 Methods with a request schema also accept `--json`; request bodies are validated
 locally against resolved Discovery schemas before authentication or network
 access. Use `gws-go schema <service> <resource> <method>` for full
@@ -175,12 +186,19 @@ line. `--fields id,name,owner.displayName` selects dotted response fields, while
 
 Use `--params-file` and `--json-file` to load JSON from files. A path of `-`, or
 `--params -`/`--json -`, reads one input from stdin. `--output` writes the raw
-response to a file. Methods whose Discovery metadata supports multipart media
-upload accept `--upload` and an optional `--upload-content-type`.
+response to a file. Methods whose Discovery metadata supports media upload
+accept `--upload` and an optional `--upload-content-type`. Multipart uploads
+stream from disk instead of being assembled in memory. Methods advertising
+Google's resumable protocol also accept `--resumable` and
+`--upload-chunk-size`; the Drive helper provides `--resumable` and
+`--chunk-size`. `--progress` reports transfer progress to stderr. Saved-file
+results include a SHA-256 checksum.
 
-Each API request has a 30-second timeout and retries HTTP 408, 429, 500, 502,
-503, and 504 responses up to four times with exponential backoff. Google
-`Retry-After` responses are honored. Use `--timeout`, `--max-retries`, and
+Each API request has a 30-second timeout and retries transport failures plus HTTP
+408, 429, 500, 502, 503, and 504 responses up to four times with exponential
+backoff. Google `Retry-After` responses are honored. Retries are automatic for
+idempotent methods and requests carrying a `requestId`; potentially unsafe
+writes require `--retry-unsafe`. Use `--timeout`, `--max-retries`, and
 `--retry-delay` to change these values; `--timeout 0` disables the per-request
 timeout.
 
@@ -195,12 +213,18 @@ uses only `https://www.googleapis.com/auth/gmail.readonly`; Gmail rejects send,
 modify, and delete operations. The `gmail-write` scope preset replaces that
 read-only scope with `gmail.modify` and `gmail.send`.
 
+Raw `--output` responses and Drive downloads are streamed through an atomic
+temporary file, avoiding the JSON response-size limit and partial destination
+files. `drive download` inspects the file type and automatically uses Drive
+export for Google Docs, Sheets, Slides, Drawings, and Apps Script projects. Its
+`--export-format` flag can explicitly select formats such as PDF, DOCX, XLSX,
+PPTX, CSV, or SVG.
+
 Handwritten helpers provide shorter commands for common tasks: Calendar agenda
 and event creation, Docs text insertion, Sheets reads and appends, Drive
 uploads/downloads/sharing, and Gmail reads/searches/exports. These helpers reuse
 Discovery request validation, dry runs, retries, timeouts, field selection, and
-output formats. Drive download handles stored media; Google-native Docs, Sheets,
-and Slides files require the raw Drive `files.export` method instead.
+output formats.
 
 Google no longer permits apps to search an existing personal Photos library by
 date. The supported Picker flow opens Google Photos so you can select the media

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/hairizuanbinnoorazman/gws-go/internal/api"
+	"github.com/hairizuanbinnoorazman/gws-go/internal/auth"
 	"github.com/hairizuanbinnoorazman/gws-go/internal/clierr"
 	"github.com/hairizuanbinnoorazman/gws-go/internal/discovery"
 	"github.com/spf13/cobra"
@@ -229,13 +230,15 @@ func newDriveUploadCommand(doc *discovery.Document, out io.Writer) *cobra.Comman
 	command.Flags().StringVar(&name, "name", "", "Drive filename (defaults to the local filename)")
 	command.Flags().StringVar(&folderID, "folder", "", "parent folder ID")
 	command.Flags().StringVar(&contentType, "mime-type", "", "media MIME type (detected from the filename when omitted)")
+	command.Flags().BoolVar(&opts.ResumableUpload, "resumable", false, "use Google's resumable upload protocol")
+	command.Flags().Int64Var(&opts.UploadChunkSize, "chunk-size", 8<<20, "resumable upload chunk size in bytes (multiple of 256 KiB)")
 	_ = command.MarkFlagRequired("file")
 	addHelperExecutionFlags(command, &opts, out)
 	return command
 }
 
 func newDriveDownloadCommand(doc *discovery.Document, out io.Writer) *cobra.Command {
-	var fileID, outputPath string
+	var fileID, outputPath, exportFormat string
 	var force bool
 	var opts api.Options
 	command := &cobra.Command{
@@ -250,22 +253,149 @@ func newDriveDownloadCommand(doc *discovery.Document, out io.Writer) *cobra.Comm
 					return clierr.New("filesystem_error", "inspect output file", clierr.ExitFilesystem, err)
 				}
 			}
-			method, err := discoveredMethod(doc, "files", "get")
-			if err != nil {
-				return err
-			}
-			opts.ParamsJSON, _ = marshalOption(map[string]any{"fileId": fileID, "alt": "media"})
 			opts.OutputPath = outputPath
-			return executeHelper(command, doc, method, &opts)
+			return executeDriveDownload(command, doc, fileID, exportFormat, &opts)
 		},
 	}
 	command.Flags().StringVar(&fileID, "file", "", "Drive file ID")
 	command.Flags().StringVarP(&outputPath, "output", "o", "", "destination file")
+	command.Flags().StringVar(&exportFormat, "export-format", "auto", "Google-native export format: auto, pdf, docx, xlsx, pptx, csv, tsv, txt, html, odt, ods, odp, epub, rtf, png, jpg, svg, or json")
 	command.Flags().BoolVar(&force, "force", false, "replace an existing destination")
 	_ = command.MarkFlagRequired("file")
 	_ = command.MarkFlagRequired("output")
 	addHelperExecutionFlagsWithoutOutput(command, &opts, out)
 	return command
+}
+
+func executeDriveDownload(command *cobra.Command, doc *discovery.Document, fileID, exportFormat string, opts *api.Options) error {
+	if exportFormat != "auto" {
+		exportMIME, err := exportMIMEForFormat(exportFormat)
+		if err != nil {
+			return clierr.New("invalid_argument", err.Error(), clierr.ExitInput, err)
+		}
+		method, err := discoveredMethod(doc, "files", "export")
+		if err != nil {
+			return err
+		}
+		opts.ParamsJSON, _ = marshalOption(map[string]any{"fileId": fileID, "mimeType": exportMIME})
+		return executeHelper(command, doc, method, opts)
+	}
+
+	getMethod, err := discoveredMethod(doc, "files", "get")
+	if err != nil {
+		return err
+	}
+	if opts.DryRun {
+		opts.ParamsJSON, _ = marshalOption(map[string]any{"fileId": fileID, "alt": "media"})
+		return executeHelper(command, doc, getMethod, opts)
+	}
+	client, err := auth.HTTPClient(command.Context())
+	if err != nil {
+		return clierr.New("authentication_error", "authentication failed", clierr.ExitAuth, err)
+	}
+	var metadataOutput bytes.Buffer
+	metadataOptions := *opts
+	metadataOptions.OutputPath = ""
+	metadataOptions.Out = &metadataOutput
+	metadataOptions.Format = "json"
+	metadataOptions.Fields = ""
+	metadataOptions.Quiet = false
+	metadataOptions.ParamsJSON, _ = marshalOption(map[string]any{"fileId": fileID})
+	executor := api.Executor{Client: client}
+	if err := executor.Execute(command.Context(), doc, getMethod, metadataOptions); err != nil {
+		return err
+	}
+	var metadata struct {
+		MIMEType string `json:"mimeType"`
+	}
+	if err := json.Unmarshal(metadataOutput.Bytes(), &metadata); err != nil {
+		return clierr.New("invalid_response", "decode Drive file metadata", clierr.ExitAPI, err)
+	}
+	if !strings.HasPrefix(metadata.MIMEType, "application/vnd.google-apps.") {
+		opts.ParamsJSON, _ = marshalOption(map[string]any{"fileId": fileID, "alt": "media"})
+		return executor.Execute(command.Context(), doc, getMethod, *opts)
+	}
+	exportMethod, err := discoveredMethod(doc, "files", "export")
+	if err != nil {
+		return err
+	}
+	exportMIME, err := automaticDriveExportMIME(metadata.MIMEType, opts.OutputPath)
+	if err != nil {
+		return clierr.New("unsupported_export", err.Error(), clierr.ExitInput, err)
+	}
+	opts.ParamsJSON, _ = marshalOption(map[string]any{"fileId": fileID, "mimeType": exportMIME})
+	return executor.Execute(command.Context(), doc, exportMethod, *opts)
+}
+
+var driveExportFormats = map[string]string{
+	"pdf":  "application/pdf",
+	"docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+	"xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+	"pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+	"csv":  "text/csv",
+	"tsv":  "text/tab-separated-values",
+	"txt":  "text/plain",
+	"html": "text/html",
+	"odt":  "application/vnd.oasis.opendocument.text",
+	"ods":  "application/vnd.oasis.opendocument.spreadsheet",
+	"odp":  "application/vnd.oasis.opendocument.presentation",
+	"epub": "application/epub+zip",
+	"rtf":  "application/rtf",
+	"png":  "image/png",
+	"jpg":  "image/jpeg",
+	"jpeg": "image/jpeg",
+	"svg":  "image/svg+xml",
+	"json": "application/vnd.google-apps.script+json",
+}
+
+func exportMIMEForFormat(format string) (string, error) {
+	mimeType, ok := driveExportFormats[strings.ToLower(format)]
+	if !ok {
+		return "", fmt.Errorf("unsupported Drive export format %q", format)
+	}
+	return mimeType, nil
+}
+
+func automaticDriveExportMIME(sourceMIME, outputPath string) (string, error) {
+	extension := strings.TrimPrefix(strings.ToLower(filepath.Ext(outputPath)), ".")
+	if extension != "" {
+		if requested, ok := driveExportFormats[extension]; ok && driveExportCompatible(sourceMIME, extension) {
+			return requested, nil
+		}
+	}
+	switch sourceMIME {
+	case "application/vnd.google-apps.document":
+		return driveExportFormats["docx"], nil
+	case "application/vnd.google-apps.spreadsheet":
+		return driveExportFormats["xlsx"], nil
+	case "application/vnd.google-apps.presentation":
+		return driveExportFormats["pptx"], nil
+	case "application/vnd.google-apps.drawing":
+		return driveExportFormats["pdf"], nil
+	case "application/vnd.google-apps.script":
+		return driveExportFormats["json"], nil
+	default:
+		return "", fmt.Errorf("drive file type %q cannot be exported automatically; use --export-format", sourceMIME)
+	}
+}
+
+func driveExportCompatible(sourceMIME, format string) bool {
+	allowed := map[string]map[string]bool{
+		"application/vnd.google-apps.document": {
+			"pdf": true, "docx": true, "txt": true, "html": true, "odt": true, "epub": true, "rtf": true,
+		},
+		"application/vnd.google-apps.spreadsheet": {
+			"pdf": true, "xlsx": true, "csv": true, "tsv": true, "ods": true,
+		},
+		"application/vnd.google-apps.presentation": {
+			"pdf": true, "pptx": true, "txt": true, "odp": true,
+		},
+		"application/vnd.google-apps.drawing": {
+			"pdf": true, "png": true, "jpg": true, "jpeg": true, "svg": true,
+		},
+		"application/vnd.google-apps.script": {"json": true},
+	}
+	return allowed[sourceMIME][format]
 }
 
 func newDriveShareCommand(doc *discovery.Document, out io.Writer) *cobra.Command {
@@ -471,6 +601,8 @@ func addHelperExecutionFlagsWithoutOutput(command *cobra.Command, opts *api.Opti
 	command.Flags().DurationVar(&opts.RequestTimeout, "timeout", 30*time.Second, "timeout for the HTTP request (0 disables)")
 	command.Flags().IntVar(&opts.MaxRetries, "max-retries", 4, "maximum retries for HTTP 408, 429, and transient 5xx responses")
 	command.Flags().DurationVar(&opts.RetryDelay, "retry-delay", 500*time.Millisecond, "initial exponential retry delay")
+	command.Flags().BoolVar(&opts.RetryUnsafe, "retry-unsafe", false, "allow retries for non-idempotent API methods")
+	command.Flags().BoolVar(&opts.ShowProgress, "progress", false, "report transfer progress to stderr")
 	command.Flags().StringVar(&opts.Format, "format", "json", "output format: json, jsonl, table, yaml, or csv")
 	command.Flags().StringVar(&opts.Fields, "fields", "", "comma-separated dotted response fields to select")
 	command.Flags().BoolVarP(&opts.Quiet, "quiet", "q", false, "print only resource IDs or fields selected with --fields")

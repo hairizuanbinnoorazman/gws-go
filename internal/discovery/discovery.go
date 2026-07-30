@@ -63,7 +63,8 @@ type MediaUpload struct {
 
 // MediaUploadProtocols contains the available Google media upload protocols.
 type MediaUploadProtocols struct {
-	Simple *MediaUploadProtocol `json:"simple"`
+	Simple    *MediaUploadProtocol `json:"simple"`
+	Resumable *MediaUploadProtocol `json:"resumable"`
 }
 
 // MediaUploadProtocol describes one upload endpoint.

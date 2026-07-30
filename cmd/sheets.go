@@ -156,6 +156,9 @@ func sheetsValuesMethod(doc *discovery.Document, name string) (*discovery.Method
 }
 
 func executeHelper(command *cobra.Command, doc *discovery.Document, method *discovery.Method, opts *api.Options) error {
+	if opts.ShowProgress {
+		opts.ProgressOut = command.ErrOrStderr()
+	}
 	var clientErr error
 	var executor api.Executor
 	if !opts.DryRun {
@@ -174,6 +177,8 @@ func addHelperExecutionFlags(command *cobra.Command, opts *api.Options, out io.W
 	command.Flags().DurationVar(&opts.RequestTimeout, "timeout", 30*time.Second, "timeout for the HTTP request (0 disables)")
 	command.Flags().IntVar(&opts.MaxRetries, "max-retries", 4, "maximum retries for HTTP 408, 429, and transient 5xx responses")
 	command.Flags().DurationVar(&opts.RetryDelay, "retry-delay", 500*time.Millisecond, "initial exponential retry delay")
+	command.Flags().BoolVar(&opts.RetryUnsafe, "retry-unsafe", false, "allow retries for non-idempotent API methods")
+	command.Flags().BoolVar(&opts.ShowProgress, "progress", false, "report transfer progress to stderr")
 	command.Flags().StringVar(&opts.Format, "format", "json", "output format: json, jsonl, table, yaml, or csv")
 	command.Flags().StringVar(&opts.Fields, "fields", "", "comma-separated dotted response fields to select")
 	command.Flags().BoolVarP(&opts.Quiet, "quiet", "q", false, "print only resource IDs or fields selected with --fields")

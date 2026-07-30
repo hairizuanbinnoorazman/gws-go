@@ -117,3 +117,47 @@ func TestUploadFlagsOnlyAppearForMultipartMethods(t *testing.T) {
 		t.Fatalf("non-upload method unexpectedly has upload flag: command=%v err=%v", list, err)
 	}
 }
+
+func TestDiscoveredParametersHaveNativeFlags(t *testing.T) {
+	doc := &discovery.Document{
+		Name:    "drive",
+		BaseURL: "https://drive.example/",
+		Parameters: map[string]*discovery.Parameter{
+			"fields": {Type: "string"},
+		},
+	}
+	method := &discovery.Method{
+		HTTPMethod: http.MethodGet,
+		Path:       "files/{fileId}",
+		Parameters: map[string]*discovery.Parameter{
+			"fileId":      {Type: "string", Location: "path", Required: true},
+			"maxResults":  {Type: "integer"},
+			"prettyPrint": {Type: "boolean"},
+			"labelIds":    {Type: "string", Repeated: true},
+		},
+	}
+	var output bytes.Buffer
+	command := buildMethodCommandAtPath(doc, "get", method, &output, []string{"files"})
+	command.SetArgs([]string{
+		"--params", `{"maxResults":1}`,
+		"--file-id", "file-1",
+		"--max-results", "25",
+		"--pretty-print",
+		"--label-ids", "one",
+		"--label-ids", "two",
+		"--api-fields", "id,name",
+		"--dry-run",
+	})
+	if err := command.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	result := output.String()
+	for _, expected := range []string{
+		"files/file-1", "maxResults=25", "prettyPrint=true",
+		"labelIds=one", "labelIds=two", "fields=id%2Cname",
+	} {
+		if !strings.Contains(result, expected) {
+			t.Fatalf("missing %q in %s", expected, result)
+		}
+	}
+}

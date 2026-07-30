@@ -102,6 +102,22 @@ func TestDriveHelpersDryRun(t *testing.T) {
 		t.Fatalf("download = %q", download.String())
 	}
 
+	var exported bytes.Buffer
+	exportCommand := newDriveDownloadCommand(doc, &exported)
+	exportCommand.SetArgs([]string{
+		"--file", "file-1",
+		"--output", filepath.Join(t.TempDir(), "saved.pdf"),
+		"--export-format", "pdf",
+		"--dry-run",
+	})
+	if err := exportCommand.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(exported.String(), "files/file-1/export") ||
+		!strings.Contains(exported.String(), "mimeType=application%2Fpdf") {
+		t.Fatalf("export = %q", exported.String())
+	}
+
 	var share bytes.Buffer
 	shareCommand := newDriveShareCommand(doc, &share)
 	shareCommand.SetArgs([]string{"--file", "file-1", "--email", "ada@example.com", "--role", "writer", "--dry-run"})
@@ -158,6 +174,41 @@ func TestGmailHelpersDryRun(t *testing.T) {
 	}
 }
 
+func TestAutomaticDriveExportMIMEUsesFileExtensionAndDefaults(t *testing.T) {
+	tests := []struct {
+		source string
+		output string
+		want   string
+	}{
+		{
+			source: "application/vnd.google-apps.document",
+			output: "report.pdf",
+			want:   "application/pdf",
+		},
+		{
+			source: "application/vnd.google-apps.document",
+			output: "report",
+			want:   "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+		},
+		{
+			source: "application/vnd.google-apps.spreadsheet",
+			output: "data.csv",
+			want:   "text/csv",
+		},
+		{
+			source: "application/vnd.google-apps.presentation",
+			output: "slides.pptx",
+			want:   "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+		},
+	}
+	for _, test := range tests {
+		got, err := automaticDriveExportMIME(test.source, test.output)
+		if err != nil || got != test.want {
+			t.Fatalf("source=%q output=%q got=%q want=%q err=%v", test.source, test.output, got, test.want, err)
+		}
+	}
+}
+
 func workspaceHelpersTestDocument() *discovery.Document {
 	return &discovery.Document{
 		Name:    "workspace",
@@ -192,6 +243,10 @@ func workspaceHelpersTestDocument() *discovery.Document {
 				"get": {
 					HTTPMethod: "GET", Path: "files/{fileId}",
 					Parameters: parameters("fileId"),
+				},
+				"export": {
+					HTTPMethod: "GET", Path: "files/{fileId}/export",
+					Parameters: parameters("fileId", "mimeType"),
 				},
 			}},
 			"permissions": {Methods: map[string]*discovery.Method{

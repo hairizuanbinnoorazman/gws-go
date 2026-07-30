@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -151,6 +152,77 @@ func TestExecutorUploadsMultipartMedia(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), `"file-id"`) {
 		t.Fatalf("unexpected output: %s", out.String())
+	}
+}
+
+func TestExecutorUploadsMediaResumablyInChunks(t *testing.T) {
+	uploadPath := t.TempDir() + "/archive.bin"
+	if err := os.WriteFile(uploadPath, make([]byte, 600<<10), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var ranges []string
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.Method {
+		case http.MethodPost:
+			if r.URL.Query().Get("uploadType") != "resumable" ||
+				r.Header.Get("X-Upload-Content-Length") != "614400" {
+				t.Fatalf("unexpected initialization: url=%s headers=%v", r.URL, r.Header)
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Location": []string{"https://upload.example/session-1"}},
+				Body:       io.NopCloser(strings.NewReader("")),
+			}, nil
+		case http.MethodPut:
+			ranges = append(ranges, r.Header.Get("Content-Range"))
+			contents, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if int64(len(contents)) != r.ContentLength {
+				t.Fatalf("chunk bytes=%d content-length=%d", len(contents), r.ContentLength)
+			}
+			if len(ranges) < 3 {
+				end := int64(len(ranges))*(256<<10) - 1
+				return &http.Response{
+					StatusCode: 308,
+					Header:     http.Header{"Range": []string{"bytes=0-" + strconv.FormatInt(end, 10)}},
+					Body:       io.NopCloser(strings.NewReader("")),
+				}, nil
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"id":"uploaded"}`)),
+			}, nil
+		default:
+			t.Fatalf("unexpected method %s", r.Method)
+			return nil, nil
+		}
+	})}
+	method := &discovery.Method{
+		HTTPMethod:          http.MethodPost,
+		Path:                "files",
+		SupportsMediaUpload: true,
+		MediaUpload: &discovery.MediaUpload{Protocols: discovery.MediaUploadProtocols{
+			Resumable: &discovery.MediaUploadProtocol{Path: "resumable/drive/v3/files"},
+		}},
+	}
+	var out strings.Builder
+	err := (Executor{Client: client}).Execute(context.Background(),
+		&discovery.Document{RootURL: "https://www.googleapis.com/", BaseURL: "https://www.googleapis.com/drive/v3/"},
+		method,
+		Options{
+			UploadPath: uploadPath, ResumableUpload: true, UploadChunkSize: 256 << 10,
+			UploadContentType: "application/octet-stream", Out: &out,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ranges) != 3 || ranges[0] != "bytes 0-262143/614400" ||
+		ranges[2] != "bytes 524288-614399/614400" || !strings.Contains(out.String(), `"uploaded"`) {
+		t.Fatalf("ranges=%v output=%q", ranges, out.String())
 	}
 }
 
@@ -361,6 +433,101 @@ func TestExecutorRetriesWithExponentialBackoffAndRetryAfter(t *testing.T) {
 	}
 }
 
+func TestExecutorRetriesTransportFailureForSafeRequest(t *testing.T) {
+	requests := 0
+	client := &http.Client{Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		requests++
+		if requests == 1 {
+			return nil, errors.New("connection reset")
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+		}, nil
+	})}
+	err := (Executor{Client: client, Sleep: func(context.Context, time.Duration) error { return nil }}).Execute(
+		context.Background(),
+		&discovery.Document{BaseURL: "https://example.test/"},
+		&discovery.Method{HTTPMethod: http.MethodGet, Path: "items"},
+		Options{MaxRetries: 1, Out: io.Discard},
+	)
+	if err != nil || requests != 2 {
+		t.Fatalf("requests=%d err=%v", requests, err)
+	}
+}
+
+func TestExecutorDoesNotRetryUnsafeTransportFailureWithoutOptIn(t *testing.T) {
+	requests := 0
+	client := &http.Client{Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		requests++
+		return nil, errors.New("connection reset")
+	})}
+	err := (Executor{Client: client, Sleep: func(context.Context, time.Duration) error { return nil }}).Execute(
+		context.Background(),
+		&discovery.Document{BaseURL: "https://example.test/"},
+		&discovery.Method{HTTPMethod: http.MethodPost, Path: "items"},
+		Options{MaxRetries: 3, Out: io.Discard},
+	)
+	if err == nil || requests != 1 {
+		t.Fatalf("requests=%d err=%v", requests, err)
+	}
+}
+
+func TestExecutorRetriesUnsafeTransportFailureWithOptIn(t *testing.T) {
+	requests := 0
+	client := &http.Client{Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		requests++
+		if requests == 1 {
+			return nil, errors.New("connection reset")
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"created":true}`)),
+		}, nil
+	})}
+	err := (Executor{Client: client, Sleep: func(context.Context, time.Duration) error { return nil }}).Execute(
+		context.Background(),
+		&discovery.Document{BaseURL: "https://example.test/"},
+		&discovery.Method{HTTPMethod: http.MethodPost, Path: "items"},
+		Options{MaxRetries: 1, RetryUnsafe: true, Out: io.Discard},
+	)
+	if err != nil || requests != 2 {
+		t.Fatalf("requests=%d err=%v", requests, err)
+	}
+}
+
+func TestExecutorStreamsLargeOutputToFile(t *testing.T) {
+	const size = int64(64<<20 + 1)
+	client := &http.Client{Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/octet-stream"}},
+			Body:       io.NopCloser(io.LimitReader(constantReader{}, size)),
+		}, nil
+	})}
+	outputPath := t.TempDir() + "/large.bin"
+	var output strings.Builder
+	err := (Executor{Client: client}).Execute(
+		context.Background(),
+		&discovery.Document{BaseURL: "https://example.test/"},
+		&discovery.Method{HTTPMethod: http.MethodGet, Path: "media"},
+		Options{OutputPath: outputPath, Out: &output},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != size || !strings.Contains(output.String(), `"bytes": 67108865`) ||
+		!strings.Contains(output.String(), `"sha256"`) {
+		t.Fatalf("size=%d output=%q", info.Size(), output.String())
+	}
+}
+
 func TestExecutorReturnsStructuredAPIErrorAfterRetries(t *testing.T) {
 	client := &http.Client{Transport: roundTripFunc(func(_ *http.Request) (*http.Response, error) {
 		return &http.Response{
@@ -405,4 +572,13 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
 	return fn(request)
+}
+
+type constantReader struct{}
+
+func (constantReader) Read(buffer []byte) (int, error) {
+	for index := range buffer {
+		buffer[index] = 'x'
+	}
+	return len(buffer), nil
 }

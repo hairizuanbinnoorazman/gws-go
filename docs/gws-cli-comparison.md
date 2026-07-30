@@ -17,9 +17,9 @@ tooling, and several distribution formats.
 | Helper commands | 25 service helpers and workflows | 11 task-oriented helpers across Calendar, Docs, Sheets, Drive, and Gmail |
 | Authentication | OAuth setup/login/export, encrypted keyring, service accounts, ADC | Desktop OAuth login and access-token environment variable |
 | Output | JSON, table, YAML, and CSV | JSON, JSONL, table, YAML, CSV, quiet field output, and raw file output |
-| Media transfer | Multipart uploads and media downloads | Multipart uploads, stored Drive-file downloads, Gmail `.eml` exports, and Photos Picker downloads |
+| Media transfer | Multipart uploads and media downloads | Streaming multipart and resumable uploads, streaming Drive downloads, automatic Google-native exports, Gmail `.eml` exports, and Photos Picker downloads |
 | Schema support | Introspection and request-body validation | Reference-resolved introspection, schema-aware help, and request-body validation |
-| Reliability | Retries for rate limits and transient network failures | Exponential retries for HTTP 408, 429, and transient 5xx responses; honors `Retry-After`; configurable per-request timeout |
+| Reliability | Retries for rate limits and transient network failures | Safe transport and HTTP retries with exponential backoff; honors `Retry-After`; configurable per-request timeout |
 | Agent tooling | Generated skills, personas, recipes, Gemini extension | None |
 | Errors | Structured JSON errors and distinct exit codes | Structured JSON errors and distinct exit codes |
 | Response safety | Model Armor and terminal sanitization | Response-size limits |
@@ -85,8 +85,6 @@ The Rust CLI additionally provides:
 
 - Automatic media-download handling
 - Model Armor response sanitization
-- Retries for connection failures (`gws-go` currently retries HTTP 408, 429,
-  and transient 5xx responses but not transport failures)
 - API-version overrides
 - A fallback Discovery URL for newer Google APIs
 - Account-timezone discovery for calendar and workflow helpers
@@ -117,3 +115,22 @@ Both implementations provide:
 - Raw response output to a file
 - Browser-based OAuth with PKCE
 - Pre-obtained OAuth access tokens
+
+## Recommended future priorities
+
+The following priorities remain after the transfer, native-flag, transport-retry,
+and automatic Drive-export work:
+
+1. **Named accounts and credential profiles.** Add commands such as
+   `auth login --account work`, `auth list`, and `auth use`, plus a global
+   `--account`. Follow with service-account credentials and Application Default
+   Credentials.
+2. **Cross-service workflows.** Add focused commands such as `meeting-prep`,
+   `weekly-digest`, `email-to-task`, and `standup-report`, building on the
+   existing helper execution layer.
+3. **Google Tasks and People APIs.** These enable task creation, contact lookup,
+   attendee enrichment, and the proposed cross-service workflows. Google Chat
+   is the next useful integration for notifications.
+4. **Offline and Discovery-cache controls.** Add stale-cache fallback,
+   `cache status`, `cache refresh`, `cache clear`, `--offline`, and configurable
+   API versions.

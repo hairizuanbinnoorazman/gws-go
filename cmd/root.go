@@ -162,6 +162,7 @@ func buildResourceCommandAtPath(doc *discovery.Document, name string, resource *
 
 func buildMethodCommandAtPath(doc *discovery.Document, name string, method *discovery.Method, out io.Writer, resourcePath []string) *cobra.Command {
 	var opts api.Options
+	applyParameterFlags := func() error { return nil }
 	command := &cobra.Command{
 		Use:     name,
 		Short:   firstLine(method.Description),
@@ -169,6 +170,12 @@ func buildMethodCommandAtPath(doc *discovery.Document, name string, method *disc
 		Example: methodExample(doc, resourcePath, name, method),
 		Args:    cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) error {
+			if err := applyParameterFlags(); err != nil {
+				return clierr.New("invalid_argument", err.Error(), clierr.ExitInput, err)
+			}
+			if opts.ShowProgress {
+				opts.ProgressOut = command.ErrOrStderr()
+			}
 			var client *http.Client
 			var err error
 			if !opts.DryRun {
@@ -188,9 +195,14 @@ func buildMethodCommandAtPath(doc *discovery.Document, name string, method *disc
 		command.Flags().StringVar(&opts.BodyFile, "json-file", "", "read the request body from a JSON file (- for stdin)")
 	}
 	command.Flags().StringVarP(&opts.OutputPath, "output", "o", "", "write the raw response body to a file")
-	if method.SupportsMediaUpload && method.MediaUpload != nil && method.MediaUpload.Protocols.Simple != nil && method.MediaUpload.Protocols.Simple.Multipart {
+	if method.SupportsMediaUpload && method.MediaUpload != nil &&
+		(method.MediaUpload.Protocols.Simple != nil || method.MediaUpload.Protocols.Resumable != nil) {
 		command.Flags().StringVar(&opts.UploadPath, "upload", "", "local file to upload as multipart media content")
 		command.Flags().StringVar(&opts.UploadContentType, "upload-content-type", "", "MIME type of the uploaded file (detected automatically when omitted)")
+	}
+	if method.SupportsMediaUpload && method.MediaUpload != nil && method.MediaUpload.Protocols.Resumable != nil {
+		command.Flags().BoolVar(&opts.ResumableUpload, "resumable", false, "upload media with Google's resumable upload protocol")
+		command.Flags().Int64Var(&opts.UploadChunkSize, "upload-chunk-size", 8<<20, "resumable upload chunk size in bytes (multiple of 256 KiB)")
 	}
 	command.Flags().BoolVar(&opts.DryRun, "dry-run", false, "print the request without sending it")
 	command.Flags().BoolVar(&opts.PageAll, "page-all", false, "fetch all pages as sequential JSON values")
@@ -199,9 +211,12 @@ func buildMethodCommandAtPath(doc *discovery.Document, name string, method *disc
 	command.Flags().DurationVar(&opts.RequestTimeout, "timeout", 30*time.Second, "timeout for each HTTP request (0 disables)")
 	command.Flags().IntVar(&opts.MaxRetries, "max-retries", 4, "maximum retries for HTTP 408, 429, and 5xx responses")
 	command.Flags().DurationVar(&opts.RetryDelay, "retry-delay", 500*time.Millisecond, "initial exponential retry delay")
+	command.Flags().BoolVar(&opts.RetryUnsafe, "retry-unsafe", false, "allow retries for non-idempotent API methods")
+	command.Flags().BoolVar(&opts.ShowProgress, "progress", false, "report transfer progress to stderr")
 	command.Flags().StringVar(&opts.Format, "format", "json", "output format: json, jsonl, table, yaml, or csv")
 	command.Flags().StringVar(&opts.Fields, "fields", "", "comma-separated dotted response fields to select")
 	command.Flags().BoolVarP(&opts.Quiet, "quiet", "q", false, "print only resource IDs or fields selected with --fields")
+	applyParameterFlags = addDiscoveredParameterFlags(command, doc, method, &opts)
 	return command
 }
 
