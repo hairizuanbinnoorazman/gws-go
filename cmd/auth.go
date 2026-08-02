@@ -44,14 +44,20 @@ func newLoginCommand(out io.Writer) *cobra.Command {
 				NoBrowser:        noBrowser,
 				Timeout:          timeout,
 				Scopes:           selectedScopes,
-				Out:              out,
+				TokenFile: func() string {
+					if scopes == "" && scopePreset == "maps" {
+						return "maps_token.json"
+					}
+					return ""
+				}(),
+				Out: out,
 			})
 		},
 	}
 	command.Flags().StringVar(&clientSecret, "client-secret", "", "path to a Google Desktop OAuth client JSON file")
 	command.Flags().BoolVar(&noBrowser, "no-browser", false, "print the authorization URL without opening a browser")
 	command.Flags().StringVar(&scopes, "scopes", "", "comma-separated OAuth scope URLs (defaults to all supported services and read-only Gmail)")
-	command.Flags().StringVar(&scopePreset, "scope-preset", "standard", "OAuth scope preset: standard or gmail-write")
+	command.Flags().StringVar(&scopePreset, "scope-preset", "standard", "OAuth scope preset: standard, gmail-write, or maps")
 	command.Flags().DurationVar(&timeout, "timeout", 5*time.Minute, "maximum time to wait for the browser callback")
 	return command
 }

@@ -39,14 +39,35 @@ var DefaultScopes = []string{
 	"https://www.googleapis.com/auth/photospicker.mediaitems.readonly",
 }
 
+// MapsPortabilityScopes grant export access to the personal Maps data groups
+// exposed by Google's Data Portability API. Google Maps Timeline/location
+// history is not one of the available resource groups.
+var MapsPortabilityScopes = []string{
+	"https://www.googleapis.com/auth/dataportability.maps.aliased_places",
+	"https://www.googleapis.com/auth/dataportability.maps.commute_routes",
+	"https://www.googleapis.com/auth/dataportability.maps.commute_settings",
+	"https://www.googleapis.com/auth/dataportability.maps.ev_profile",
+	"https://www.googleapis.com/auth/dataportability.maps.factual_contributions",
+	"https://www.googleapis.com/auth/dataportability.maps.offering_contributions",
+	"https://www.googleapis.com/auth/dataportability.maps.photos_videos",
+	"https://www.googleapis.com/auth/dataportability.maps.questions_answers",
+	"https://www.googleapis.com/auth/dataportability.maps.reviews",
+	"https://www.googleapis.com/auth/dataportability.maps.starred_places",
+	"https://www.googleapis.com/auth/dataportability.myactivity.maps",
+	"https://www.googleapis.com/auth/dataportability.mymaps.maps",
+}
+
 // ScopesForPreset returns a copy of the scopes granted by a named login preset.
 // Gmail write access is never included in the default standard preset.
 func ScopesForPreset(name string) ([]string, error) {
 	if name == "" || name == "standard" {
 		return append([]string(nil), DefaultScopes...), nil
 	}
+	if name == "maps" {
+		return append([]string(nil), MapsPortabilityScopes...), nil
+	}
 	if name != "gmail-write" {
-		return nil, fmt.Errorf("unknown scope preset %q; use standard or gmail-write", name)
+		return nil, fmt.Errorf("unknown scope preset %q; use standard, gmail-write, or maps", name)
 	}
 	result := make([]string, 0, len(DefaultScopes)+1)
 	for _, scope := range DefaultScopes {
@@ -83,6 +104,7 @@ type LoginOptions struct {
 	NoBrowser        bool
 	Timeout          time.Duration
 	Scopes           []string
+	TokenFile        string
 	Out              io.Writer
 }
 
@@ -170,7 +192,7 @@ func Login(ctx context.Context, opts LoginOptions) error {
 	if token.RefreshToken == "" {
 		return errors.New("google did not return a refresh token; revoke the app grant and retry auth login")
 	}
-	if err := SaveToken(token); err != nil {
+	if err := saveToken(token, opts.TokenFile); err != nil {
 		return err
 	}
 	_, err = fmt.Fprintln(opts.Out, "Authentication successful. Offline refresh token saved.")
@@ -212,23 +234,33 @@ func callbackHandler(expectedState string, result chan<- callbackResult) http.Ha
 
 // HTTPClient returns an authenticated client, refreshing saved tokens as needed.
 func HTTPClient(ctx context.Context) (*http.Client, error) {
+	return httpClient(ctx, "", DefaultScopes, "gws-go auth login")
+}
+
+// MapsHTTPClient returns a client authenticated with the separate Maps Data
+// Portability grant. Google forbids mixing these scopes with Workspace scopes.
+func MapsHTTPClient(ctx context.Context) (*http.Client, error) {
+	return httpClient(ctx, "maps_token.json", MapsPortabilityScopes, "gws-go auth login --scope-preset maps")
+}
+
+func httpClient(ctx context.Context, tokenFile string, scopes []string, loginCommand string) (*http.Client, error) {
 	if token := os.Getenv(TokenEnv); token != "" {
 		return oauth2.NewClient(ctx, oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})), nil
 	}
 	client, err := loadClient()
 	if err != nil {
-		return nil, fmt.Errorf("not authenticated; run 'gws-go auth login': %w", err)
+		return nil, fmt.Errorf("not authenticated; run '%s': %w", loginCommand, err)
 	}
-	token, err := LoadToken()
+	token, err := loadToken(tokenFile)
 	if err != nil {
-		return nil, fmt.Errorf("not authenticated; run 'gws-go auth login': %w", err)
+		return nil, fmt.Errorf("not authenticated; run '%s': %w", loginCommand, err)
 	}
-	config := oauthConfig(client, "http://127.0.0.1", DefaultScopes)
+	config := oauthConfig(client, "http://127.0.0.1", scopes)
 	current, err := config.TokenSource(ctx, token).Token()
 	if err != nil {
 		return nil, fmt.Errorf("refresh OAuth token: %w", err)
 	}
-	if err := SaveToken(current); err != nil {
+	if err := saveToken(current, tokenFile); err != nil {
 		return nil, err
 	}
 	return oauth2.NewClient(ctx, oauth2.StaticTokenSource(current)), nil
@@ -241,28 +273,41 @@ func Status() (string, error) {
 	}
 	token, err := LoadToken()
 	if err != nil {
+		if _, mapsErr := loadToken("maps_token.json"); mapsErr == nil {
+			return "authenticated for Maps exports only", nil
+		}
 		return "not authenticated", err
 	}
-	if token.RefreshToken != "" {
-		return "authenticated (offline refresh token available)", nil
+	mapsSuffix := ""
+	if _, mapsErr := loadToken("maps_token.json"); mapsErr == nil {
+		mapsSuffix = "; Maps export token available"
 	}
-	return "authenticated (access token only)", nil
+	if token.RefreshToken != "" {
+		return "authenticated (offline refresh token available" + mapsSuffix + ")", nil
+	}
+	return "authenticated (access token only" + mapsSuffix + ")", nil
 }
 
 // Logout removes the locally saved OAuth token.
 func Logout() error {
-	path, err := tokenPath()
+	dir, err := appconfig.Dir()
 	if err != nil {
 		return err
 	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
+	for _, name := range []string{"token.json", "maps_token.json"} {
+		if err := os.Remove(filepath.Join(dir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
 	}
 	return nil
 }
 
 // SaveToken atomically persists an OAuth token with owner-only permissions.
 func SaveToken(token *oauth2.Token) error {
+	return saveToken(token, "")
+}
+
+func saveToken(token *oauth2.Token, name string) error {
 	dir, err := appconfig.EnsureDir()
 	if err != nil {
 		return err
@@ -271,15 +316,26 @@ func SaveToken(token *oauth2.Token) error {
 	if err != nil {
 		return err
 	}
-	return atomicWrite(filepath.Join(dir, "token.json"), append(data, '\n'), 0o600)
+	if name == "" {
+		name = "token.json"
+	}
+	return atomicWrite(filepath.Join(dir, name), append(data, '\n'), 0o600)
 }
 
 // LoadToken reads the locally persisted OAuth token.
 func LoadToken() (*oauth2.Token, error) {
-	path, err := tokenPath()
+	return loadToken("")
+}
+
+func loadToken(name string) (*oauth2.Token, error) {
+	dir, err := appconfig.Dir()
 	if err != nil {
 		return nil, err
 	}
+	if name == "" {
+		name = "token.json"
+	}
+	path := filepath.Join(dir, name)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -372,14 +428,6 @@ func openBrowser(url string) error {
 		name, args = "xdg-open", []string{url}
 	}
 	return exec.Command(name, args...).Start()
-}
-
-func tokenPath() (string, error) {
-	dir, err := appconfig.Dir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, "token.json"), nil
 }
 
 func atomicWrite(path string, data []byte, mode os.FileMode) error {

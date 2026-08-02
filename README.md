@@ -4,7 +4,8 @@ A focused Go port of the Google Workspace CLI, built with Cobra. It exposes the
 Google Docs, Google Calendar, Google Slides, Google Sheets, Google Drive, and
 Gmail REST APIs from Google's Discovery documents and caches those documents
 for 24 hours. It also supports selecting and downloading personal media through
-the Google Photos Picker API. Gmail authorization is read-only.
+the Google Photos Picker API and exporting the personal Maps data exposed by
+Google's Data Portability API. Gmail authorization is read-only.
 
 ## Build and development
 
@@ -25,7 +26,9 @@ inside the repository (`.gomodcache/` and `bin/`) and are ignored by Git.
 
 1. In Google Cloud Console, enable the Google Docs API, Google Calendar API,
    Google Slides API, Google Sheets API, Google Drive API, Gmail API, and Google
-   Photos Picker API.
+   Photos Picker API. To use Maps exports, separately enable and configure the
+   Data Portability API; it has additional developer registration, billing,
+   regional availability, OAuth verification, and user-data policy requirements.
 2. Configure the OAuth consent screen and add your Google account as a test user
    if the app is in testing mode.
 3. Create an OAuth client with application type **Desktop app**, then download
@@ -51,6 +54,16 @@ For short-lived automation, `GWS_GO_TOKEN` can provide an access token directly.
 Existing users must run `auth login` again to grant the Google Photos Picker
 and Google Sheets scopes.
 
+Personal Maps exports use restricted/sensitive Data Portability scopes and are
+therefore opt-in. Google prohibits mixing them with Workspace scopes, so gws-go
+stores this grant as a separate token. Authorize it with:
+
+```sh
+bin/gws-go auth login \
+  --client-secret ~/Downloads/client_secret.json \
+  --scope-preset maps
+```
+
 The default `standard` scope preset keeps Gmail read-only. To explicitly grant
 Gmail send and modify access for discovered write methods, log in with:
 
@@ -75,6 +88,7 @@ bin/gws-go sheets --help
 bin/gws-go gmail --help
 bin/gws-go drive --help
 bin/gws-go photos --help
+bin/gws-go maps --help
 
 # Inspect accepted parameters and the resolved request schema
 bin/gws-go schema calendar events insert
@@ -150,6 +164,15 @@ bin/gws-go drive share --file FILE_ID \
 
 # Pick a day's photos or videos in Google Photos and download them
 bin/gws-go photos download --output-dir ./day-photos
+
+# Export Maps activity (searches and directions) for one local day
+bin/gws-go maps export --date 2026-08-02 --output-dir ./maps-activity
+
+# See and export other supported personal Maps data groups
+bin/gws-go maps resources
+bin/gws-go maps export \
+  --resources maps.starred_places,maps.reviews \
+  --output-dir ./maps-data
 
 # Validate and preview a request without authenticating or sending it
 bin/gws-go calendar events insert \
@@ -230,6 +253,15 @@ Google no longer permits apps to search an existing personal Photos library by
 date. The supported Picker flow opens Google Photos so you can select the media
 for the day, waits for you to finish, downloads the selected media, and cleans
 up the Picker session.
+
+Google Maps Timeline and location-history visits are not exposed by either the
+Google Maps Platform APIs or the Data Portability API. Timeline is stored on
+your signed-in device and must be exported from the Google Maps mobile app as
+`location-history.json`. The `maps export --date` command instead exports Maps
+activity for that day—such as searches and directions—which can be useful but
+must not be interpreted as a record of places actually visited. Other available
+exports include labeled and Starred places, pinned commute routes, reviews,
+contributions, posted media, and My Maps data.
 
 This is intentionally not a full port. It does not yet include the original
 CLI's full set of workflows, encrypted keyring storage, service accounts, or

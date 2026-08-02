@@ -86,7 +86,7 @@ func isCommandInputError(err error) bool {
 func newRootCommand(deps dependencies) *cobra.Command {
 	root := &cobra.Command{
 		Use:           "gws-go",
-		Short:         "Google Workspace CLI for Docs, Calendar, Slides, Sheets, Drive, Gmail, and Photos",
+		Short:         "Google Workspace CLI for Docs, Calendar, Slides, Sheets, Drive, Gmail, Photos, and Maps data",
 		Version:       version,
 		SilenceErrors: true,
 		SilenceUsage:  true,
@@ -96,6 +96,7 @@ func newRootCommand(deps dependencies) *cobra.Command {
 	root.PersistentFlags().String("error-format", "text", "error output format: text or json")
 	root.AddCommand(newAuthCommand(deps.out))
 	root.AddCommand(newPhotosCommand(deps.out))
+	root.AddCommand(newMapsCommand(deps.out))
 	root.AddCommand(newSchemaCommand(deps))
 	for _, item := range services {
 		root.AddCommand(newServiceCommand(item, deps))

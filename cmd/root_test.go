@@ -11,7 +11,7 @@ import (
 
 func TestRootHasRequestedServices(t *testing.T) {
 	root := newRootCommand(dependencies{out: &bytes.Buffer{}, errOut: &bytes.Buffer{}})
-	for _, name := range []string{"auth", "docs", "calendar", "slides", "gmail", "drive", "sheets", "photos", "schema"} {
+	for _, name := range []string{"auth", "docs", "calendar", "slides", "gmail", "drive", "sheets", "photos", "maps", "schema"} {
 		if root.Commands()[0] == nil {
 			t.Fatal("unexpected empty command list")
 		}

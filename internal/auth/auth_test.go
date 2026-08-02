@@ -99,6 +99,21 @@ func TestGmailWriteScopeIsOptIn(t *testing.T) {
 	}
 }
 
+func TestMapsScopePresetIncludesOnlyPortabilityScopes(t *testing.T) {
+	scopes, err := ScopesForPreset("maps")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, scope := range MapsPortabilityScopes {
+		if !slices.Contains(scopes, scope) {
+			t.Fatalf("maps scopes do not contain %q: %#v", scope, scopes)
+		}
+	}
+	if slices.Contains(scopes, "https://www.googleapis.com/auth/documents") {
+		t.Fatalf("maps preset mixes Data Portability and Workspace scopes: %#v", scopes)
+	}
+}
+
 func TestDefaultScopesIncludePhotosPicker(t *testing.T) {
 	const picker = "https://www.googleapis.com/auth/photospicker.mediaitems.readonly"
 	if !slices.Contains(DefaultScopes, picker) {
